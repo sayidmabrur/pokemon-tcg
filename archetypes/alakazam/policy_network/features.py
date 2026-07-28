@@ -137,6 +137,23 @@ def diff_board_state(previous: dict[str, Any], current: dict[str, Any]) -> dict[
     }
 
 
+def decision_context(
+    selection: dict[str, Any], options: list[dict[str, Any]], player_index: int
+) -> dict[str, Any]:
+    """POV-normalised selection/options for whoever is making *this* decision.
+
+    Reused both for the current row's own decision and for building a
+    same-actor decision chain within a turn (``dataset.py``) — legitimate to
+    look at raw past decisions of the actor *itself*, unlike doing the same
+    for the opponent (see ``diff_board_state`` for why opponent history is a
+    board diff, not their raw selection/options).
+    """
+    return {
+        "selection": _strip_player_index(selection),
+        "options": _remap_options(options, player_index),
+    }
+
+
 def extract_features(
     state: dict[str, Any],
     selection: dict[str, Any],
@@ -156,10 +173,7 @@ def extract_features(
         "state": board_state(state, player_index),
         "opponent_state": board_state(state, 1 - player_index),
         "global_state": _global_state(state),
-        "decision_context": {
-            "selection": _strip_player_index(selection),
-            "options": _remap_options(options, player_index),
-        },
+        "decision_context": decision_context(selection, options, player_index),
     }
 
 

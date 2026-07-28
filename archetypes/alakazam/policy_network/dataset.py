@@ -7,7 +7,7 @@ from bisect import bisect_right
 import torch
 from torch.utils.data import Dataset
 
-from features import EMPTY_BOARD_STATE, board_state, diff_board_state, extract_features
+from features import EMPTY_BOARD_STATE, board_state, decision_context, diff_board_state, extract_features
 
 
 class PolicyFeatureDataset(Dataset):
@@ -32,6 +32,11 @@ class PolicyFeatureDataset(Dataset):
         about themselves; diffed against ``EMPTY_BOARD_STATE`` for their
         first captured turn so every entry has the same shape. Empty unless
         ``opponent_history_size > 0``.
+      - ``features["decision_chain"]``: this same actor's earlier decisions
+        within the *current, still in-progress* turn (oldest first) —
+        selection/options/chosen target, since this is the actor's own past
+        choices, not something being inferred about the opponent. Empty
+        unless ``decision_chain_size > 0``.
       - ``meta``: bookkeeping only (``episode_id``, ``frame_index``,
         ``player_index``, ``player_name``) — everything is already reoriented
         to the deciding player's POV, so ``player_index`` is not a feature
@@ -48,6 +53,7 @@ class PolicyFeatureDataset(Dataset):
         parquet_path: str | Path,
         transform: Callable[[dict[str, Any]], Any] | None = None,
         opponent_history_size: int = 0,
+        decision_chain_size: int = 0,
     ) -> None:
         try:
             import pyarrow.parquet as pq
@@ -71,6 +77,7 @@ class PolicyFeatureDataset(Dataset):
         self._cached_rows: list[dict[str, Any]] = []
         self.transform = transform
         self.opponent_history_size = opponent_history_size
+        self.decision_chain_size = decision_chain_size
 
     def __len__(self) -> int:
         return self._row_group_offsets[-1]
@@ -117,6 +124,31 @@ class PolicyFeatureDataset(Dataset):
             previous_board = board
         return history
 
+    def _decision_chain(self, idx: int, row: dict[str, Any]) -> list[dict[str, Any]]:
+        """Scan backward for this same actor's earlier decisions within the
+        current turn — legitimate to include their raw selection/options and
+        chosen target, since it's the actor's own memory of what it already
+        chose, not something inferred about somebody else. Interjected
+        decisions by the other player (a forced reaction mid-turn) are
+        skipped rather than ending the scan, since the chain is specifically
+        about this actor's own sequence of choices this turn.
+        """
+        episode_id, player_index, turn = row["episode_id"], row["player_index"], row["state"]["turn"]
+        chain = []
+        cursor = idx - 1
+        while cursor >= 0 and len(chain) < self.decision_chain_size:
+            prior = self._read_row(cursor)
+            if prior["episode_id"] != episode_id or prior["state"]["turn"] != turn:
+                break
+            if prior["player_index"] == player_index:
+                chain.append({
+                    **decision_context(prior["selection"], prior["options"], player_index),
+                    "target_action": prior["target_action"],
+                })
+            cursor -= 1
+        chain.reverse()
+        return chain
+
     def __getitem__(self, idx: int) -> tuple[Any, torch.Tensor]:
         if not 0 <= idx < len(self):
             raise IndexError(f"Dataset index out of range: {idx}")
@@ -126,6 +158,8 @@ class PolicyFeatureDataset(Dataset):
         features = extract_features(row["state"], row["selection"], row["options"], player_index)
         if self.opponent_history_size > 0:
             features["opponent_history"] = self._opponent_history(idx, row)
+        if self.decision_chain_size > 0:
+            features["decision_chain"] = self._decision_chain(idx, row)
         meta = {
             "episode_id": row["episode_id"],
             "frame_index": row["frame_index"],

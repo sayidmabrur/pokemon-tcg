@@ -112,7 +112,7 @@ def main() -> None:
 
     card_names = load_card_names() if verbose else {}
 
-    dataset = PolicyFeatureDataset(parquet_path, opponent_history_size=3)
+    dataset = PolicyFeatureDataset(parquet_path, opponent_history_size=3, decision_chain_size=5)
     print(f"dataset size: {len(dataset)}\n")
 
     observation, target_action = dataset[idx]
@@ -141,6 +141,15 @@ def main() -> None:
 
     print("--- opponent_history (oldest first) ---")
     print_opponent_history(features["opponent_history"], card_names)
+    print()
+
+    print("--- decision_chain (this actor, earlier this turn, oldest first) ---")
+    if features["decision_chain"]:
+        for step in features["decision_chain"]:
+            print(f"  chosen target={step['target_action']}")
+            print_decision_context(step, card_names)
+    else:
+        print("  (none — first decision this turn)")
     print()
 
     print(f"target_action: {target_action}")
