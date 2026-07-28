@@ -1,0 +1,154 @@
+  {
+    "turn": 8,
+    "hand_count": 18,
+    "deck_count": 15,
+    "prize_count": 4,
+    "discarded_cards": [
+      {
+        "id": 1152,
+        "serial": 105
+      },
+      {
+        "id": 1225,
+        "serial": 114
+      },
+      {
+        "id": 1079,
+        "serial": 89
+      },
+      {
+        "id": 5,
+        "serial": 63
+      },
+      {
+        "id": 1231,
+        "serial": 120
+      },
+      {
+        "id": 19,
+        "serial": 69
+      },
+      {
+        "id": 1097,
+        "serial": 100
+      },
+      {
+        "id": 1231,
+        "serial": 118
+      },
+      {
+        "id": 19,
+        "serial": 68
+      },
+      {
+        "id": 1129,
+        "serial": 101
+      },
+      {
+        "id": 1225,
+        "serial": 116
+      }
+    ],
+    "new_pokemon": [
+      {
+        "id": 66,
+        "serial": 71,
+        "hp": 140,
+        "maxHp": 140,
+        "appearThisTurn": True,
+        "energies": [],
+        "energyCards": [],
+        "tools": [],
+        "preEvolution": [
+          {
+            "id": 305,
+            "serial": 74
+          }
+        ]
+      },
+      {
+        "id": 743,
+        "serial": 87,
+        "hp": 140,
+        "maxHp": 140,
+        "appearThisTurn": True,
+        "energies": [],
+        "energyCards": [],
+        "tools": [],
+        "preEvolution": [
+          {
+            "id": 741,
+            "serial": 80
+          },
+          {
+            "id": 742,
+            "serial": 83
+          }
+        ]
+      },
+      {
+        "id": 743,
+        "serial": 88,
+        "hp": 140,
+        "maxHp": 140,
+        "appearThisTurn": False,
+        "energies": [
+          5
+        ],
+        "energyCards": [
+          {
+            "id": 19,
+            "serial": 66
+          }
+        ],
+        "tools": [],
+        "preEvolution": [
+          {
+            "id": 741,
+            "serial": 77
+          },
+          {
+            "id": 742,
+            "serial": 84
+          }
+        ]
+      },
+      {
+        "id": 140,
+        "serial": 72,
+        "hp": 210,
+        "maxHp": 210,
+        "appearThisTurn": False,
+        "energies": [],
+        "energyCards": [],
+        "tools": [],
+        "preEvolution": []
+      },
+      {
+        "id": 741,
+        "serial": 78,
+        "hp": 50,
+        "maxHp": 50,
+        "appearThisTurn": True,
+        "energies": [],
+        "energyCards": [],
+        "tools": [],
+        "preEvolution": []
+      },
+      {
+        "id": 741,
+        "serial": 79,
+        "hp": 50,
+        "maxHp": 50,
+        "appearThisTurn": True,
+        "energies": [],
+        "energyCards": [],
+        "tools": [],
+        "preEvolution": []
+      }
+    ],
+    "removed_pokemon": [],
+    "energy_attached": [],
+    "hp_lost": 0,
+    "status_applied": []
+  }
