@@ -6,6 +6,7 @@ Usage:
 """
 
 import csv
+from pprint import pprint
 import sys
 from pathlib import Path
 
@@ -104,64 +105,101 @@ def print_opponent_history(history: list[dict], card_names: dict[int, str]) -> N
             print(f"    status_applied: {turn_diff['status_applied']}")
 
 
-def main() -> None:
-    parquet_path = sys.argv[1] if len(sys.argv) > 1 else "data/policy_decisions.parquet"
-    positional = [arg for arg in sys.argv[2:] if not arg.startswith("--")]
-    verbose = "--verbose" in sys.argv[2:]
-    idx = int(positional[0]) if positional else 3
+def print_history_lengths(features: dict, dataset: PolicyFeatureDataset) -> None:
+    """One-line summary of how much history this sample actually carries.
 
-    card_names = load_card_names() if verbose else {}
-
-    dataset = PolicyFeatureDataset(parquet_path, opponent_history_size=3, decision_chain_size=5)
-    print(f"dataset size: {len(dataset)}\n")
-
-    observation, target_action = dataset[idx]
-    features, meta = observation["features"], observation["meta"]
-
-    print(f"=== sample {idx} ===")
-    print(f"episode_id={meta['episode_id']} frame_index={meta['frame_index']} "
-          f"player_index={meta['player_index']} player_name={meta['player_name']}\n")
-
-    print("--- state (yours) ---")
-    print_board(features["state"], card_names)
-    print()
-
-    print("--- opponent_state ---")
-    print_board(features["opponent_state"], card_names)
-    print()
-
-    print("--- global_state ---")
-    for key, value in features["global_state"].items():
-        print(f"  {key}: {value}")
-    print()
-
-    print("--- decision_context ---")
-    print_decision_context(features["decision_context"], card_names)
-    print()
-
-    print("--- opponent_history (oldest first) ---")
-    print_opponent_history(features["opponent_history"], card_names)
-    print()
-
-    print("--- decision_chain (this actor, earlier this turn, oldest first) ---")
-    if features["decision_chain"]:
-        for step in features["decision_chain"]:
-            print(f"  chosen target={step['target_action']}")
-            print_decision_context(step, card_names)
-    else:
-        print("  (none — first decision this turn)")
-    print()
-
-    print(f"target_action: {target_action}")
-
-    own_hand = features["state"]["hand"]
-    opp_hand = features["opponent_state"]["hand"]
-    print(f"\nsanity check: own hand visible={own_hand is not None}, "
-          f"opponent hand visible={opp_hand is not None} (expected: True, False)")
-
-    if not verbose:
-        print("\n(pass --verbose to resolve card ids to names via EN_Card_Data.csv)")
+    Both sizes are caps, not guarantees: the chain is bounded by how many
+    decisions this player has made so far in the episode, and the history by
+    how many turns the opponent has had.  Early-game samples are therefore
+    short even with the caps set to 60.
+    """
+    chain, history = features["decision_chain"], features["opponent_history"]
+    turn = features["global_state"]["turn"]
+    chain_turns = f" spanning turns {chain[0]['turn']}..{chain[-1]['turn']}" if chain else ""
+    this_turn = sum(1 for step in chain if step["turn"] == turn)
+    print(f"  decision_chain: {len(chain)}/{dataset.decision_chain_size} entries"
+          f"{chain_turns} ({this_turn} of them in the current turn {turn})")
+    history_turns = f" for turns {[entry['turn'] for entry in history]}" if history else ""
+    print(f"  opponent_history: {len(history)}/{dataset.opponent_history_size} turn diffs"
+          f"{history_turns}")
 
 
-if __name__ == "__main__":
-    main()
+# def main() -> None:
+parquet_path = sys.argv[1] if len(sys.argv) > 1 else "data/policy_decisions.parquet"
+positional = [arg for arg in sys.argv[2:] if not arg.startswith("--")]
+verbose = "--verbose" in sys.argv[2:]
+idx = int(positional[0]) if positional else 3
+
+card_names = load_card_names() if verbose else {}
+
+dataset = PolicyFeatureDataset(parquet_path)
+# dataset[0]
+pprint('player turn:')
+pprint(dataset[5][0]['meta'])
+print("features:")
+pprint(dataset[8][0]['features'])
+#     print(f"dataset size: {len(dataset)}")
+#     print(f"opponent_history_size={dataset.opponent_history_size} "
+#           f"decision_chain_size={dataset.decision_chain_size} (caps, not guarantees)\n")
+
+#     observation, target_action = dataset[idx]
+#     features, meta = observation["features"], observation["meta"]
+
+#     print(f"=== sample {idx} ===")
+#     print(f"episode_id={meta['episode_id']} frame_index={meta['frame_index']} "
+#           f"player_index={meta['player_index']} player_name={meta['player_name']}")
+#     print_history_lengths(features, dataset)
+#     print()
+
+#     print("--- state (yours) ---")
+#     print_board(features["state"], card_names)
+#     print()
+
+#     print("--- opponent_state ---")
+#     print_board(features["opponent_state"], card_names)
+#     print()
+
+#     print("--- global_state ---")
+#     for key, value in features["global_state"].items():
+#         print(f"  {key}: {value}")
+#     print()
+
+#     print("--- decision_context ---")
+#     print_decision_context(features["decision_context"], card_names)
+#     print()
+
+#     history = features["opponent_history"]
+#     print(f"--- opponent_history ({len(history)} turn diffs, oldest first) ---")
+#     if history:
+#         print_opponent_history(history, card_names)
+#     else:
+#         print("  (none — the opponent has not had a turn yet)")
+#     print()
+
+#     chain = features["decision_chain"]
+#     print(f"--- decision_chain ({len(chain)} of this actor's own earlier "
+#           f"decisions, oldest first) ---")
+#     if chain:
+#         for position, step in enumerate(chain):
+#             print(f"  [{position}] turn={step['turn']} "
+#                   f"selection_type={step['selection']['type']} "
+#                   f"options={len(step['options'])} chosen target={step['target_action']}")
+#             if verbose:
+#                 pprint(step)
+#     else:
+#         print("  (none — this is this player's first decision of the episode)")
+#     print()
+
+#     print(f"target_action: {target_action}")
+
+#     own_hand = features["state"]["hand"]
+#     opp_hand = features["opponent_state"]["hand"]
+#     print(f"\nsanity check: own hand visible={own_hand is not None}, "
+#           f"opponent hand visible={opp_hand is not None} (expected: True, False)")
+
+#     if not verbose:
+#         print("\n(pass --verbose to resolve card ids to names via EN_Card_Data.csv)")
+
+
+# if __name__ == "__main__":
+#     main()

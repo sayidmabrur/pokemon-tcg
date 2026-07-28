@@ -1,13 +1,14 @@
 """PyTorch dataset for the decision-level Pokémon TCG Parquet dataset."""
 
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 from bisect import bisect_right
 
 import torch
 from torch.utils.data import Dataset
 
-from features import EMPTY_BOARD_STATE, board_state, decision_context, diff_board_state, extract_features
+from features import decision_chain, extract_features, opponent_history
 
 
 class PolicyFeatureDataset(Dataset):
@@ -30,13 +31,17 @@ class PolicyFeatureDataset(Dataset):
         their turns — never their raw ``target_action``, since that's an
         internal option index the opponent never actually gets to observe
         about themselves; diffed against ``EMPTY_BOARD_STATE`` for their
-        first captured turn so every entry has the same shape. Empty unless
-        ``opponent_history_size > 0``.
-      - ``features["decision_chain"]``: this same actor's earlier decisions
-        within the *current, still in-progress* turn (oldest first) —
-        selection/options/chosen target, since this is the actor's own past
-        choices, not something being inferred about the opponent. Empty
-        unless ``decision_chain_size > 0``.
+        first captured turn so every entry has the same shape. The default
+        ``opponent_history_size`` of 60 is above any realistic turn count, so
+        it covers the whole match; pass 0 to switch the group off.
+      - ``features["decision_chain"]``: this same actor's own last
+        ``decision_chain_size`` decisions across the whole match (oldest
+        first) — turn/selection/options/chosen target, since this is the
+        actor's own past choices, not something being inferred about the
+        opponent. The opponent's interleaved decisions are filtered out, not
+        treated as a boundary, so this is purely the deciding player's
+        history from their own perspective; each entry's ``turn`` says which
+        turn it came from. Pass 0 to switch the group off.
       - ``meta``: bookkeeping only (``episode_id``, ``frame_index``,
         ``player_index``, ``player_name``) — everything is already reoriented
         to the deciding player's POV, so ``player_index`` is not a feature
@@ -46,14 +51,22 @@ class PolicyFeatureDataset(Dataset):
     The target is the list of option *indexes* selected by that player.  The
     index is local to ``features["decision_context"]["options"]``; it is not
     a card ID.
+
+    ``player_name`` restricts the *samples* to one agent (or several) for
+    imitation learning, so every target is a decision that agent actually
+    made.  It does not restrict what the feature builders may read: the
+    opponent's rows stay visible to the backward scans, since dropping them
+    would erase the opponent's turns from ``opponent_history``.
     """
 
     def __init__(
         self,
         parquet_path: str | Path,
         transform: Callable[[dict[str, Any]], Any] | None = None,
-        opponent_history_size: int = 0,
-        decision_chain_size: int = 0,
+        opponent_history_size: int = 60,
+        decision_chain_size: int = 60,
+        player_name: str | Iterable[str] | None = None,
+        cached_row_groups: int = 4,
     ) -> None:
         try:
             import pyarrow.parquet as pq
@@ -73,93 +86,87 @@ class PolicyFeatureDataset(Dataset):
             self._row_group_offsets.append(
                 self._row_group_offsets[-1] + self._parquet.metadata.row_group(row_group).num_rows
             )
-        self._cached_row_group: int | None = None
-        self._cached_rows: list[dict[str, Any]] = []
+        # Two caches, because the expensive step is Arrow -> Python, not I/O.
+        # Row groups are held as Arrow tables (columnar, cheap to keep around)
+        # and converted a single row at a time; converting a whole 1000-row
+        # group of nested structs to read a few rows costs ~250ms.
+        # Row groups also need slack: a backward history scan walks off the
+        # front of the group its sample sits in, so a single-group cache is
+        # evicted and refilled on every boundary crossing — fatal under a
+        # shuffling DataLoader.
+        self._table_cache: OrderedDict[int, Any] = OrderedDict()
+        self._table_cache_size = max(1, cached_row_groups)
+        self._row_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._row_cache_size = 4096
         self.transform = transform
         self.opponent_history_size = opponent_history_size
         self.decision_chain_size = decision_chain_size
+        self.player_name = player_name
+
+        self._row_indexes: list[int] | None = None
+        if player_name is not None:
+            wanted = [player_name] if isinstance(player_name, str) else list(player_name)
+            names = self._parquet.read(columns=["player_name"]).to_pandas()["player_name"]
+            self._row_indexes = names.index[names.isin(wanted)].tolist()
 
     def __len__(self) -> int:
-        return self._row_group_offsets[-1]
+        if self._row_indexes is None:
+            return self._row_group_offsets[-1]
+        return len(self._row_indexes)
+
+    def raw_index(self, idx: int) -> int:
+        """Map a sample index to its index in the underlying Parquet file.
+
+        The two differ once ``player_name`` filtering is on.  Feature builders
+        walk the *raw* space so the opponent's rows remain visible.
+        """
+        return idx if self._row_indexes is None else self._row_indexes[idx]
+
+    @staticmethod
+    def _touch(cache: OrderedDict, key: int, value: Any, limit: int) -> Any:
+        """Insert ``key`` as the most recently used entry, evicting the oldest."""
+        cache[key] = value
+        if len(cache) > limit:
+            cache.popitem(last=False)
+        return value
 
     def _read_row(self, idx: int) -> dict[str, Any]:
+        """Read a *raw* Parquet row.  Not sample-indexed — see ``raw_index``."""
+        row = self._row_cache.get(idx)
+        if row is not None:
+            self._row_cache.move_to_end(idx)
+            return row
+
         row_group = bisect_right(self._row_group_offsets, idx) - 1
-        if row_group != self._cached_row_group:
-            self._cached_rows = self._parquet.read_row_group(row_group).to_pylist()
-            self._cached_row_group = row_group
-        return self._cached_rows[idx - self._row_group_offsets[row_group]]
+        table = self._table_cache.get(row_group)
+        if table is None:
+            table = self._touch(
+                self._table_cache, row_group,
+                self._parquet.read_row_group(row_group), self._table_cache_size,
+            )
+        else:
+            self._table_cache.move_to_end(row_group)
 
-    def _opponent_history(self, idx: int, row: dict[str, Any]) -> list[dict[str, Any]]:
-        """Scan backward through this episode collecting the opponent's board
-        state after each of their most recent turns, then diff consecutively.
+        offset = idx - self._row_group_offsets[row_group]
+        row = table.slice(offset, 1).to_pylist()[0]
+        return self._touch(self._row_cache, idx, row, self._row_cache_size)
 
-        Rows for one episode are written contiguously in ascending
-        frame_index order by ``convert_replays.py``, so this is a plain
-        backward walk, not a search — scanning stays within the same or an
-        adjacent row group in practice, since episodes (~150-250 rows) are
-        far smaller than a row group.
-        """
-        episode_id, opponent_index = row["episode_id"], 1 - row["player_index"]
-        snapshots: list[tuple[int, dict[str, Any]]] = []
-        seen_turns: set[int] = set()
-        cursor = idx - 1
-        while cursor >= 0 and len(snapshots) < self.opponent_history_size:
-            prior = self._read_row(cursor)
-            if prior["episode_id"] != episode_id:
-                break
-            turn = prior["state"]["turn"]
-            # Scanning backward, the first frame seen for a given turn is
-            # that turn's *last* frame chronologically — exactly the final
-            # board state for that turn.
-            if prior["player_index"] == opponent_index and turn not in seen_turns:
-                seen_turns.add(turn)
-                snapshots.append((turn, board_state(prior["state"], opponent_index)))
-            cursor -= 1
-        snapshots.reverse()
+    def __getitem__(self, sample_idx: int) -> tuple[Any, torch.Tensor]:
+        if not 0 <= sample_idx < len(self):
+            raise IndexError(f"Dataset index out of range: {sample_idx}")
 
-        history = []
-        previous_board = EMPTY_BOARD_STATE
-        for turn, board in snapshots:
-            history.append({"turn": turn, **diff_board_state(previous_board, board)})
-            previous_board = board
-        return history
-
-    def _decision_chain(self, idx: int, row: dict[str, Any]) -> list[dict[str, Any]]:
-        """Scan backward for this same actor's earlier decisions within the
-        current turn — legitimate to include their raw selection/options and
-        chosen target, since it's the actor's own memory of what it already
-        chose, not something inferred about somebody else. Interjected
-        decisions by the other player (a forced reaction mid-turn) are
-        skipped rather than ending the scan, since the chain is specifically
-        about this actor's own sequence of choices this turn.
-        """
-        episode_id, player_index, turn = row["episode_id"], row["player_index"], row["state"]["turn"]
-        chain = []
-        cursor = idx - 1
-        while cursor >= 0 and len(chain) < self.decision_chain_size:
-            prior = self._read_row(cursor)
-            if prior["episode_id"] != episode_id or prior["state"]["turn"] != turn:
-                break
-            if prior["player_index"] == player_index:
-                chain.append({
-                    **decision_context(prior["selection"], prior["options"], player_index),
-                    "target_action": prior["target_action"],
-                })
-            cursor -= 1
-        chain.reverse()
-        return chain
-
-    def __getitem__(self, idx: int) -> tuple[Any, torch.Tensor]:
-        if not 0 <= idx < len(self):
-            raise IndexError(f"Dataset index out of range: {idx}")
-
+        idx = self.raw_index(sample_idx)
         row = self._read_row(idx)
         player_index = row["player_index"]
         features = extract_features(row["state"], row["selection"], row["options"], player_index)
         if self.opponent_history_size > 0:
-            features["opponent_history"] = self._opponent_history(idx, row)
+            features["opponent_history"] = opponent_history(
+                self._read_row, idx, row, self.opponent_history_size
+            )
         if self.decision_chain_size > 0:
-            features["decision_chain"] = self._decision_chain(idx, row)
+            features["decision_chain"] = decision_chain(
+                self._read_row, idx, row, self.decision_chain_size
+            )
         meta = {
             "episode_id": row["episode_id"],
             "frame_index": row["frame_index"],

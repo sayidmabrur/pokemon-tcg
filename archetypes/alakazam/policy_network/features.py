@@ -9,8 +9,23 @@ the transform a policy trained offline sees is bit-for-bit what it gets fed
 during live play.
 """
 
-from typing import Any
+from typing import Any, Callable
 
+
+#: Every option field the engine can emit.  The live engine omits fields that
+#: don't apply to a given option, while ``convert_replays.py`` writes them as
+#: explicit ``None``; normalising to this dense shape in ``_remap_options``
+#: keeps offline and live option dicts key-for-key identical.
+OPTION_FIELDS = (
+    "type", "number", "area", "index", "playerIndex", "toolIndex",
+    "energyIndex", "count", "inPlayArea", "inPlayIndex", "attackId",
+    "cardId", "serial", "specialConditionType",
+)
+
+SELECTION_FIELDS = (
+    "type", "context", "minCount", "maxCount", "remainDamageCounter",
+    "remainEnergyCost", "deck", "contextCard", "effect",
+)
 
 GLOBAL_STATE_FIELDS = (
     "turn", "turnActionCount", "firstPlayer", "stadium", "stadiumPlayed",
@@ -45,10 +60,14 @@ def _remap_options(options: list[dict[str, Any]], player_index: int) -> list[dic
     An option can target either player's Pokémon (e.g. an attack target), so
     unlike card/Pokémon structs this field carries real signal — it just
     needs to be relative to the deciding player, not an absolute slot index.
+
+    Fields are also filled out to the full ``OPTION_FIELDS`` set so a live
+    option (which omits inapplicable keys) and a replay-converted option
+    (which stores them as ``None``) come out identical.
     """
     remapped = []
     for option in options:
-        option = dict(option)
+        option = {field: option.get(field) for field in OPTION_FIELDS}
         raw = option.pop("playerIndex", None)
         option["targets_opponent"] = None if raw is None else raw != player_index
         remapped.append(option)
@@ -184,8 +203,119 @@ def extract_features_from_observation(observation: dict[str, Any]) -> dict[str, 
     ``current`` and ``select`` at the top level — the same shape as
     ``record["observation"]`` in a replay JSON.
     """
-    state = observation["current"]
-    selection = observation.get("select") or {}
-    options = selection.get("option", [])
-    selection = {key: value for key, value in selection.items() if key != "option"}
+    state, selection, options = split_observation(observation)
     return extract_features(state, selection, options, state["yourIndex"])
+
+
+def split_observation(
+    observation: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Split a live ``obs`` into the ``(state, selection, options)`` triple the
+    parquet stores as three separate columns — same field selection as
+    ``convert_replays.decision_rows`` so a live row and a converted row are
+    interchangeable."""
+    state = observation["current"]
+    select = observation.get("select") or {}
+    selection = {field: select.get(field) for field in SELECTION_FIELDS}
+    return state, selection, list(select.get("option") or [])
+
+
+# --------------------------------------------------------------------------
+# History over a sequence of decision rows
+#
+# A "row" here is the parquet row shape: ``episode_id``, ``player_index``,
+# ``state``, ``selection``, ``options``, ``target_action``.  Both the offline
+# dataset (rows read lazily out of Parquet) and live play (rows appended as
+# the episode unfolds) drive these through a ``read_row(index)`` callable, so
+# the two paths cannot drift.
+# --------------------------------------------------------------------------
+
+
+def opponent_history(
+    read_row: Callable[[int], dict[str, Any]],
+    idx: int,
+    row: dict[str, Any],
+    size: int,
+) -> list[dict[str, Any]]:
+    """Scan backward from ``idx`` collecting the opponent's board state at the
+    last frame seen for each of their most recent ``size`` turns, then diff
+    consecutively (oldest first).
+
+    Rows for one episode are contiguous in ascending frame order, so this is a
+    plain backward walk, not a search.  The first captured turn is diffed
+    against ``EMPTY_BOARD_STATE`` so every entry has the same shape.
+
+    Note the engine's ``turn`` counter increments once per *player* turn, so
+    grouping by it usually yields one snapshot per opponent turn.  The
+    exception is a forced opponent reaction interjected during our own turn:
+    that produces a snapshot labelled with our turn number.  It stays
+    chronologically ordered and shape-consistent, so the diffs remain valid —
+    they just aren't strictly end-of-their-turn boundaries.
+    """
+    if size <= 0:
+        return []
+    episode_id, opponent_index = row["episode_id"], 1 - row["player_index"]
+    snapshots: list[tuple[int, dict[str, Any]]] = []
+    seen_turns: set[int] = set()
+    cursor = idx - 1
+    while cursor >= 0 and len(snapshots) < size:
+        prior = read_row(cursor)
+        if prior["episode_id"] != episode_id:
+            break
+        turn = prior["state"]["turn"]
+        # Scanning backward, the first frame seen for a given turn is that
+        # turn's *last* frame chronologically — the final board for that turn.
+        if prior["player_index"] == opponent_index and turn not in seen_turns:
+            seen_turns.add(turn)
+            snapshots.append((turn, board_state(prior["state"], opponent_index)))
+        cursor -= 1
+    snapshots.reverse()
+
+    history = []
+    previous_board = EMPTY_BOARD_STATE
+    for turn, board in snapshots:
+        history.append({"turn": turn, **diff_board_state(previous_board, board)})
+        previous_board = board
+    return history
+
+
+def decision_chain(
+    read_row: Callable[[int], dict[str, Any]],
+    idx: int,
+    row: dict[str, Any],
+    size: int,
+) -> list[dict[str, Any]]:
+    """Scan backward for this same actor's ``size`` most recent earlier
+    decisions in the episode (oldest first) — the actor's own decision memory
+    over the whole match, not just the current turn.
+
+    Legitimate to include the raw selection/options and chosen
+    ``target_action`` here, since it's the actor's own memory of what it
+    already chose, not something inferred about somebody else (contrast
+    ``opponent_history``, which is a board diff for that reason).
+
+    The scan stops only at the episode boundary.  Decisions by the *other*
+    player are skipped rather than ending the scan, so the result is a clean
+    sequence of this actor's choices with the opponent's interleaved frames
+    filtered out.  Each entry carries its own ``turn``, so the model can still
+    tell which decisions belong to the turn in progress and which are older —
+    the turn boundary is recoverable, it just isn't a cutoff.
+    """
+    if size <= 0:
+        return []
+    episode_id, player_index = row["episode_id"], row["player_index"]
+    chain = []
+    cursor = idx - 1
+    while cursor >= 0 and len(chain) < size:
+        prior = read_row(cursor)
+        if prior["episode_id"] != episode_id:
+            break
+        if prior["player_index"] == player_index:
+            chain.append({
+                "turn": prior["state"]["turn"],
+                **decision_context(prior["selection"], prior["options"], player_index),
+                "target_action": prior["target_action"],
+            })
+        cursor -= 1
+    chain.reverse()
+    return chain

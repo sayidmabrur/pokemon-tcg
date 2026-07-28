@@ -20,11 +20,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-OPTION_FIELDS = (
-    "type", "number", "area", "index", "playerIndex", "toolIndex",
-    "energyIndex", "count", "inPlayArea", "inPlayIndex", "attackId",
-    "cardId", "serial", "specialConditionType",
-)
+import sys
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from features import OPTION_FIELDS, SELECTION_FIELDS  # noqa: E402
 
 
 def _card_schema(pa: Any) -> Any:
@@ -161,10 +161,7 @@ def decision_rows(replay_path: Path) -> tuple[list[dict[str, Any]], int]:
                     "step": observation.get("step"),
                     "remaining_overage_time": observation.get("remainingOverageTime"),
                     "state": observation["current"],
-                    "selection": {key: selection.get(key) for key in (
-                        "type", "context", "minCount", "maxCount", "remainDamageCounter",
-                        "remainEnergyCost", "deck", "contextCard", "effect",
-                    )},
+                    "selection": {key: selection.get(key) for key in SELECTION_FIELDS},
                     "options": [normalise_option(option) for option in selection["option"]],
                 }
     return rows, rejected

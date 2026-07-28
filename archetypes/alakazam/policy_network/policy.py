@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from torch.utils.data import Dataset, DataLoader
+from dataset import PolicyFeatureDataset
 
 from dataset import PolicyFeatureDataset
 
@@ -17,8 +18,11 @@ class PolicyNetwork(nn.Module):
 
 policy = PolicyNetwork()
 
-replays_dir = "replays/benarg/"
+from pprint import pprint
 
-dataset = PolicyFeatureDataset(replays_dir)
-
-print("dataset sample:", dataset[0])
+dataset = PolicyFeatureDataset("data/policy_decisions.parquet", player_name="Yushin Ito")
+print("dataset sample:")
+print("==="*50)
+pprint( dataset[0])
+print("==="*50)
+print(f"decision length: {len(dataset[0][0]['features']['decision_chain'])}")
