@@ -1,7 +1,9 @@
 """PyTorch dataset for the decision-level Pokémon TCG Parquet dataset."""
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
+from pprint import pprint
 from typing import Any, Callable, Iterable
 from bisect import bisect_right
 
@@ -9,6 +11,7 @@ import torch
 from torch.utils.data import Dataset
 
 from features import decision_chain, extract_features, opponent_history
+from vocab import OptionsVocab, SelectionVocab, pad_options, stack_selections
 
 
 class PolicyFeatureDataset(Dataset):
@@ -70,7 +73,9 @@ class PolicyFeatureDataset(Dataset):
     ) -> None:
         try:
             import pyarrow.parquet as pq
-        except ImportError as exc:  # Keep importing the module possible without pyarrow.
+        except (
+            ImportError
+        ) as exc:  # Keep importing the module possible without pyarrow.
             raise ImportError(
                 "PolicyFeatureDataset requires pyarrow. Install it with "
                 "`python -m pip install pyarrow`."
@@ -84,7 +89,8 @@ class PolicyFeatureDataset(Dataset):
         self._row_group_offsets = [0]
         for row_group in range(self._parquet.num_row_groups):
             self._row_group_offsets.append(
-                self._row_group_offsets[-1] + self._parquet.metadata.row_group(row_group).num_rows
+                self._row_group_offsets[-1]
+                + self._parquet.metadata.row_group(row_group).num_rows
             )
         # Two caches, because the expensive step is Arrow -> Python, not I/O.
         # Row groups are held as Arrow tables (columnar, cheap to keep around)
@@ -105,8 +111,12 @@ class PolicyFeatureDataset(Dataset):
 
         self._row_indexes: list[int] | None = None
         if player_name is not None:
-            wanted = [player_name] if isinstance(player_name, str) else list(player_name)
-            names = self._parquet.read(columns=["player_name"]).to_pandas()["player_name"]
+            wanted = (
+                [player_name] if isinstance(player_name, str) else list(player_name)
+            )
+            names = self._parquet.read(columns=["player_name"]).to_pandas()[
+                "player_name"
+            ]
             self._row_indexes = names.index[names.isin(wanted)].tolist()
 
     def __len__(self) -> int:
@@ -141,8 +151,10 @@ class PolicyFeatureDataset(Dataset):
         table = self._table_cache.get(row_group)
         if table is None:
             table = self._touch(
-                self._table_cache, row_group,
-                self._parquet.read_row_group(row_group), self._table_cache_size,
+                self._table_cache,
+                row_group,
+                self._parquet.read_row_group(row_group),
+                self._table_cache_size,
             )
         else:
             self._table_cache.move_to_end(row_group)
@@ -158,7 +170,9 @@ class PolicyFeatureDataset(Dataset):
         idx = self.raw_index(sample_idx)
         row = self._read_row(idx)
         player_index = row["player_index"]
-        features = extract_features(row["state"], row["selection"], row["options"], player_index)
+        features = extract_features(
+            row["state"], row["selection"], row["options"], player_index
+        )
         if self.opponent_history_size > 0:
             features["opponent_history"] = opponent_history(
                 self._read_row, idx, row, self.opponent_history_size
@@ -190,3 +204,91 @@ def decision_collate(
     """
     observations, actions = zip(*batch)
     return list(observations), list(actions)
+
+
+
+def pad_target_actions(decision_chain):
+    """``target_action`` is one index per single-select decision but several
+    for a multi-select one (e.g. discarding/ordering multiple cards), so it's
+    ragged the same way ``options`` is — pad to ``(chain_len, max_targets)``
+    with a validity mask rather than assuming a fixed width of 1."""
+    per_decision = [
+        torch.tensor(decision["target_action"], dtype=torch.long) for decision in decision_chain
+    ]
+    chain_len = len(per_decision)
+    max_targets = max((t.numel() for t in per_decision), default=0)
+    target_action = torch.full((chain_len, max_targets), -1, dtype=torch.long)
+    mask = torch.zeros((chain_len, max_targets), dtype=torch.bool)
+    for i, t in enumerate(per_decision):
+        target_action[i, : t.numel()] = t
+        mask[i, : t.numel()] = True
+    return target_action, mask
+
+
+def transform_decision_chain(decision_chain):
+    turns = torch.tensor([decision["turn"] for decision in decision_chain], dtype=torch.long)
+    target_action, target_action_mask = pad_target_actions(decision_chain)
+    options = [OptionsVocab.from_options(decision["options"]) for decision in decision_chain]
+    selections = [SelectionVocab.from_selection(decision["selection"]) for decision in decision_chain]
+    return {
+        "turn": turns,
+        "target_action": target_action,
+        "target_action_mask": target_action_mask,
+        "options": pad_options(options),
+        "selection": stack_selections(selections),
+    }
+
+def transform(row):
+    # print("row:")
+    # pprint(row)
+
+    # Decision Chain Continuous Sequence data from timestep 0 -> t-1
+    # Options (Discrete sequence): available options at timestep t = x1, x2, ... x_n
+    # selection (): the context of the options at timestep t
+    # action : the chosen option index at timestep t
+    decision_chain = row["features"]["decision_chain"]
+    print("decision_chain:")
+    pprint(decision_chain)
+    print("==="*50)
+    decision_chain_tensor = transform_decision_chain(decision_chain)
+    print("decision_chain_tensor:")
+    pprint(decision_chain_tensor)
+    print("decision_chain length:", len(decision_chain))
+
+
+
+    # Decision context at timestep current timestep t
+    # Options (Discrete sequence): available options at timestep t = x1, x2, ... x_n
+    # selection (): the context of the options at timestep t
+    decision_context = row["features"]["decision_context"]
+
+    # Global state at timestep t
+    global_state = row["features"]["global_state"]
+    # pprint(global_state)
+
+    # Opponent states from timestep 0 -> t-1
+    opponent_history = row["features"]["opponent_history"]
+
+    # Opponent state at timestep t
+    opponent_state = row["features"]["opponent_state"]
+    # print("opponent_state:")
+    # pprint(opponent_state)
+
+
+    # Player state at timestep t
+    player_state = row["features"]["state"]
+
+
+
+
+    return row
+
+
+dataset = PolicyFeatureDataset(
+    "data/policy_decisions.parquet", player_name="Yushin Ito", transform=transform)
+dataset[79]
+# print("dataset sample:")
+# print("==="*50)
+# pprint(dataset[1])
+# print("==="*50)
+# print(f"decision length: {len(dataset[1][0]['features']['decision_chain'])}")
