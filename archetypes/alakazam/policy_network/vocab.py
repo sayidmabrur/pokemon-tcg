@@ -235,6 +235,16 @@ for _card in all_card_data():
     _CARD_ACE_SPEC[_card.cardId] = int(_card.aceSpec)
 del _card, _stage
 
+#: ``stage`` is genuinely ordinal (BASIC < STAGE1 < STAGE2 — more evolved),
+#: but as a raw int it's used as a categorical embedding index, which
+#: doesn't guarantee the model respects that order. This is a companion
+#: float in [0, 1] (``stage / (CardStage members - 1)``) carrying just the
+#: "how evolved is this" magnitude explicitly, alongside (not instead of)
+#: the categorical ``stage`` — ``NOT_APPLICABLE`` (0, non-Pokémon) and
+#: ``BASIC`` (1) both map near the low end, which is an acceptable overlap
+#: since neither is "evolved."
+_CARD_STAGE_NORM = _CARD_STAGE.float() / (len(CardStage) - 1)
+
 
 def card_type_flags(
     card_id: torch.Tensor, fields: tuple[str, ...] | None = None
@@ -253,6 +263,7 @@ def card_type_flags(
     """
     all_flags = {
         "stage": _CARD_STAGE[card_id],
+        "stage_norm": _CARD_STAGE_NORM[card_id],
         "type": _CARD_TYPE[card_id],
         "energy_type": _CARD_ENERGY_TYPE[card_id],
         "ex": _CARD_EX[card_id],

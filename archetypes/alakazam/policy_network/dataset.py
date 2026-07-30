@@ -643,9 +643,3 @@ def transform(row):
         "opponent_state": transform_player_state(row["features"]["opponent_state"]),
         "state": transform_player_state(row["features"]["state"]),
     }
-
-from pprint import pprint
-
-dataset = PolicyFeatureDataset(
-    "data/policy_decisions.parquet", player_name="Yushin Ito", transform=transform)
-pprint(dataset[79])

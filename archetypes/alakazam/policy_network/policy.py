@@ -6,16 +6,32 @@ import torch
 import torch.nn as nn
 
 from torch.utils.data import Dataset, DataLoader
-from dataset import PolicyFeatureDataset
+from dataset import PolicyFeatureDataset, transform
 from vocab import OptionsVocab, SelectionVocab
 
+class DecisionChainEncoder(nn.Module):
+    pass
 
-@dataclass
-class DecisionContextVocab:
-    options: OptionsVocab
-    selection: SelectionVocab
+class PlayerStateEncoder(nn.Module):
+    pass
 
-class PolicyNetwork(nn.Module):
+class DecisionContextEncoder(nn.Module):
+    pass
+
+class OpponentStateEncoder(nn.Module):
+    pass
+
+class PlayerStateEncoder(nn.Module):
+    pass
+
+class OpponentHistoryEncoder(nn.Module):
+    pass
+
+class GlobalStateEncoder(nn.Module):
+    pass
+
+
+class PolicyNetworkEncoder(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -24,13 +40,15 @@ class PolicyNetwork(nn.Module):
         pass
 
 
-policy = PolicyNetwork()
+policy = PolicyNetworkEncoder()
 
 
 dataset = PolicyFeatureDataset(
-    "data/policy_decisions.parquet", player_name="Yushin Ito")
+    "data/policy_decisions.parquet", player_name="Yushin Ito", transform=transform)
 print("dataset sample:")
-print("==="*50)
-pprint(dataset[79])
-print("==="*50)
-print(f"decision length: {len(dataset[1][0]['features']['decision_chain'])}")
+print("===" * 50)
+# pprint(dataset[79])
+print("===" * 50)
+# print(f"decision chain length: {len(dataset[79][0]['features']['decision_chain']['turn'])}")
+print("View all keys:")
+print(dataset[79][0]['features'].keys())
