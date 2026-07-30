@@ -28,7 +28,7 @@ from policy_experimental import PolicyNetwork
 from collate import collate_features
 
 
-episodes = 100
+episodes = 10
 
 p0 = read_deck_csv()
 p1 = read_deck_csv()
@@ -47,13 +47,19 @@ class BCPolicy:
     opponent_history scans).
     """
 
-    def __init__(self, checkpoint: str | None = "policy_network/bc_policy.pt"):
+    def __init__(self, checkpoint: str | None = None):
         self.policy = PolicyNetwork()
-        checkpoint_path = Path(checkpoint) if checkpoint else None
-        if checkpoint_path and checkpoint_path.is_file():
+        # Resolve relative to this file, not the process's cwd — otherwise
+        # where the checkpoint is found depends on which directory you
+        # happened to launch the script from.
+        if checkpoint is None:
+            checkpoint_path = Path(__file__).parent / "policy_network" / "bc_policy.pt"
+        else:
+            checkpoint_path = Path(checkpoint)
+        if checkpoint_path.is_file():
             self.policy.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
         else:
-            print(f"[BCPolicy] no checkpoint at {checkpoint!r} — using randomly initialized weights")
+            print(f"[BCPolicy] no checkpoint at {checkpoint_path} — using randomly initialized weights")
         self.policy.eval()
 
     def act(self, obs: dict, observation: dict) -> list[int]:
@@ -125,5 +131,7 @@ for i in range(episodes):
     else:
         p1_win += 1
     # break
+    winner = "p0" if result == 0 else "p1"
+    print(f"Episode {i+1}/{episodes} finished in {step} steps. Winner: {winner}")
 print("rule_based_policy win:", p0_win)
 print("rl_policy win:", p1_win)
