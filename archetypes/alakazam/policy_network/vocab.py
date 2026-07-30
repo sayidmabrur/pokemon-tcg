@@ -34,6 +34,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from cg.api import all_attack, all_card_data  # noqa: E402
 
 
+class EnergyType(IntEnum):
+    COLORLESS = 0
+    GRASS = 1
+    FIRE = 2
+    WATER = 3
+    LIGHTNING = 4
+    PSYCHIC = 5
+    FIGHTING = 6
+    DARKNESS = 7
+    METAL = 8
+    DRAGON = 9
+    RAINBOW = 10  # Every type.
+    TEAM_ROCKET = 11  # Psychic and Darkness.
+
+
+class CardType(IntEnum):
+    POKEMON = 0
+    ITEM = 1
+    TOOL = 2  # Pokémon Tool.
+    SUPPORTER = 3
+    STADIUM = 4
+    BASIC_ENERGY = 5
+    SPECIAL_ENERGY = 6
+
+
 class AreaType(IntEnum):
     DECK = 1
     HAND = 2
@@ -47,14 +72,6 @@ class AreaType(IntEnum):
     PRE_EVOLUTION = 10
     PLAYER = 11
     LOOKING = 12
-
-
-class SpecialConditionType(IntEnum):
-    POISON = 0
-    BURN = 1
-    SLEEP = 2
-    PARALYZE = 3
-    CONFUSE = 4
 
 
 class OptionType(IntEnum):
@@ -157,12 +174,101 @@ MAX_ATTACK_ID = len(all_attack())
 CARD_ID_VOCAB_SIZE = MAX_CARD_ID + 1
 ATTACK_ID_VOCAB_SIZE = MAX_ATTACK_ID + 1
 
+
+class CardStage(IntEnum):
+    """Pokémon evolution stage. Trainer/Energy cards (``basic``/``stage1``/
+    ``stage2`` all ``False`` in ``CardData`` — confirmed against
+    ``all_card_data()``: 206 of 1267 cards) get ``NOT_APPLICABLE``, same as
+    the ``card_id`` 0 padding/no-card sentinel."""
+
+    NOT_APPLICABLE = 0
+    BASIC = 1
+    STAGE1 = 2
+    STAGE2 = 3
+
+
+CARD_STAGE_VOCAB_SIZE = len(CardStage)
+
+#: ``CardType``/``EnergyType`` are always populated in ``CardData`` (never
+#: ``None`` — confirmed against all 1267 cards), but their own members start
+#: at 0, so a card_id-0 "no card" sentinel would collide with a real
+#: ``POKEMON``/``COLORLESS`` value if looked up unshifted. +1 here, same
+#: convention as every other Optional-enum vocab size in this module.
+CARD_TYPE_VOCAB_SIZE = len(CardType) + 1
+CARD_ENERGY_TYPE_VOCAB_SIZE = len(EnergyType) + 1
+
+#: Per-``card_id`` static lookup tables (``cg.api.CardData``'s ``cardType``/
+#: ``energyType``/``ex``/``megaEx``/``tera``/``aceSpec``/stage flags), built
+#: once from ``all_card_data()`` so a board Pokémon's ``id`` can be joined
+#: against its card-type flags without shipping the whole card database
+#: through the dataset. Index 0 is the ``card_id`` "no card" sentinel, so
+#: every table is sized ``CARD_ID_VOCAB_SIZE`` with index 0 left at its
+#: default (0/False) — already correct for the shifted ``card_type``/
+#: ``energy_type`` tables too, since 0 there means "no card" not a real enum
+#: member.
+_CARD_STAGE = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_TYPE = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_ENERGY_TYPE = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+#: ``torch.long`` 0/1, not ``torch.bool`` — these are model-input features
+#: (unlike a padding/validity mask), so they follow the same ``int(bool)``
+#: convention used for every other boolean feature in this codebase
+#: (``poisoned``, ``stadium_played``, etc.) rather than the mask dtype.
+_CARD_EX = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_MEGA_EX = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_TERA = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_ACE_SPEC = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+for _card in all_card_data():
+    if _card.basic:
+        _stage = CardStage.BASIC
+    elif _card.stage1:
+        _stage = CardStage.STAGE1
+    elif _card.stage2:
+        _stage = CardStage.STAGE2
+    else:
+        _stage = CardStage.NOT_APPLICABLE
+    _CARD_STAGE[_card.cardId] = _stage
+    _CARD_TYPE[_card.cardId] = _card.cardType + 1
+    _CARD_ENERGY_TYPE[_card.cardId] = _card.energyType + 1
+    _CARD_EX[_card.cardId] = int(_card.ex)
+    _CARD_MEGA_EX[_card.cardId] = int(_card.megaEx)
+    _CARD_TERA[_card.cardId] = int(_card.tera)
+    _CARD_ACE_SPEC[_card.cardId] = int(_card.aceSpec)
+del _card, _stage
+
+
+def card_type_flags(
+    card_id: torch.Tensor, fields: tuple[str, ...] | None = None
+) -> dict[str, torch.Tensor]:
+    """Look up static ``CardData`` type flags for a tensor of ``card_id``s
+    (any shape) — ``card_id`` 0 (the "no card" sentinel) resolves to
+    ``CardStage.NOT_APPLICABLE``/0 (no ``CardType``/``EnergyType``)/``False``
+    for every flag.
+
+    ``fields`` restricts which flags get looked up, for card slots where
+    some are confirmed structurally dead: e.g. an attached Energy card is
+    always ``BASIC_ENERGY``/``SPECIAL_ENERGY`` (never a Pokémon), so
+    ``stage``/``ex``/``mega_ex``/``tera`` are ``False``/``NOT_APPLICABLE``
+    for all 20 energy cards in ``all_card_data()`` — but ``ace_spec`` isn't
+    (3 real ACE SPEC energy cards exist), so it stays available to request.
+    """
+    all_flags = {
+        "stage": _CARD_STAGE[card_id],
+        "type": _CARD_TYPE[card_id],
+        "energy_type": _CARD_ENERGY_TYPE[card_id],
+        "ex": _CARD_EX[card_id],
+        "mega_ex": _CARD_MEGA_EX[card_id],
+        "tera": _CARD_TERA[card_id],
+        "ace_spec": _CARD_ACE_SPEC[card_id],
+    }
+    if fields is None:
+        return all_flags
+    return {flag: all_flags[flag] for flag in fields}
+
 #: +1 on every enum used as an Optional field, to reserve 0 as "field not set
 #: for this option/selection" — every one of these IntEnums' own members
 #: already start at 0, so 0 can't double as both a real value and "unset".
 OPTION_TYPE_VOCAB_SIZE = len(OptionType)
 AREA_VOCAB_SIZE = len(AreaType) + 1
-SPECIAL_CONDITION_VOCAB_SIZE = len(SpecialConditionType) + 1
 SELECT_TYPE_VOCAB_SIZE = len(SelectType)
 SELECT_CONTEXT_VOCAB_SIZE = len(SelectContext) + 1  # +1 slack: enum may grow
 
@@ -176,10 +282,6 @@ NO_VALUE = -1
 
 def _area(value: int | None) -> int:
     return 0 if value is None else int(value)
-
-
-def _special_condition(value: int | None) -> int:
-    return 0 if value is None else int(value) + 1
 
 
 def _card_id(value: int | None) -> int:
@@ -208,7 +310,6 @@ class OptionsVocab:
     area: torch.Tensor
     index: torch.Tensor
     targets_opponent: torch.Tensor
-    tool_index: torch.Tensor
     energy_index: torch.Tensor
     count: torch.Tensor
     in_play_area: torch.Tensor
@@ -216,7 +317,6 @@ class OptionsVocab:
     attack_id: torch.Tensor
     card_id: torch.Tensor
     serial: torch.Tensor
-    special_condition_type: torch.Tensor
 
     @classmethod
     def from_options(cls, options: list[dict[str, Any]]) -> "OptionsVocab":
@@ -228,7 +328,6 @@ class OptionsVocab:
             targets_opponent=torch.tensor(
                 [_targets_opponent(o["targets_opponent"]) for o in options], dtype=torch.long
             ),
-            tool_index=torch.tensor([_magnitude(o["toolIndex"]) for o in options], dtype=torch.long),
             energy_index=torch.tensor([_magnitude(o["energyIndex"]) for o in options], dtype=torch.long),
             count=torch.tensor([_magnitude(o["count"]) for o in options], dtype=torch.long),
             in_play_area=torch.tensor([_area(o["inPlayArea"]) for o in options], dtype=torch.long),
@@ -236,9 +335,6 @@ class OptionsVocab:
             attack_id=torch.tensor([_magnitude(o["attackId"]) for o in options], dtype=torch.long),
             card_id=torch.tensor([_card_id(o["cardId"]) for o in options], dtype=torch.long),
             serial=torch.tensor([_magnitude(o["serial"]) for o in options], dtype=torch.long),
-            special_condition_type=torch.tensor(
-                [_special_condition(o["specialConditionType"]) for o in options], dtype=torch.long
-            ),
         )
 
 
@@ -303,10 +399,10 @@ def pad_options(per_decision_options: list[OptionsVocab]) -> dict[str, torch.Ten
         mask[i, : options.type.numel()] = True
 
     magnitude_fields = (
-        "number", "index", "tool_index", "energy_index", "count",
+        "number", "index", "energy_index", "count",
         "in_play_index", "attack_id", "serial",
     )
-    zero_filled_fields = ("area", "targets_opponent", "card_id", "special_condition_type")
+    zero_filled_fields = ("area", "targets_opponent", "card_id")
 
     result = {"type": stack("type", 0), "options_mask": mask}
     for field in magnitude_fields:

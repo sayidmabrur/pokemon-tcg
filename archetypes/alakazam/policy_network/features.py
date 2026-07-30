@@ -313,6 +313,7 @@ def decision_chain(
         if prior["player_index"] == player_index:
             chain.append({
                 "turn": prior["state"]["turn"],
+                "turn_action_count": prior["state"]["turnActionCount"],
                 **decision_context(prior["selection"], prior["options"], player_index),
                 "target_action": prior["target_action"],
             })
