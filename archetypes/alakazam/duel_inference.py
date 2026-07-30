@@ -76,7 +76,11 @@ class BCPolicy:
 
 
 rule_based_policy = PolicyRuleBased()
-rl_policy = BCPolicy()
+# The repo-root copy (earliest timestamp of the 3 on disk) is the one that
+# predates the later debug/smoke-test runs which clobbered the
+# policy_network/ copy with a throwaway 1000-sample checkpoint — this is
+# the real ~5-hour trained one.
+rl_policy = BCPolicy(checkpoint=str(_REPO_ROOT / "bc_policy.pt"))
 
 
 policies = [rule_based_policy, rl_policy]
