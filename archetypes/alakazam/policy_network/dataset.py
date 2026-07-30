@@ -196,7 +196,7 @@ class PolicyFeatureDataset(Dataset):
         }
         observation = {"features": features, "meta": meta}
         if self.transform is not None:
-            observation = self.transform(observation)
+            observation = {"features": self.transform(observation), "meta": meta}
         return observation, torch.tensor(row["target_action"], dtype=torch.long)
 
 
