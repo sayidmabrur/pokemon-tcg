@@ -7,6 +7,7 @@ Produces ``submission/`` plus ``submission.zip`` containing:
     main.py                                  agent() entry point (inference)
     deck.csv                                 60 card ids
     bc_policy.pt                             trained weights
+    bc_policy.pt.meta.json                   decode threshold calibrated for them
     cg/                                      game engine (incl. native libs)
     archetypes/alakazam/policy_network/      feature pipeline + network
 
@@ -25,8 +26,11 @@ Verify the result before submitting:
 
     python make_submission.py --verify
 
-which imports the bundle in a fresh interpreter and plays a full match
-through it, exercising the same ``agent()`` the harness will call.
+which loads the bundle in a fresh interpreter the same way the grader does
+— ``exec``ing main.py against a bare globals dict, not importing it — and
+plays a full match through the resulting ``agent()``.  The distinction is
+not academic: an import binds ``__file__``/``__name__``, so a module-level
+dependency on either passes an import-based check and fails at grading.
 """
 
 import argparse
@@ -78,6 +82,21 @@ def build(deck: Path, checkpoint: Path, out_dir: Path, zip_path: Path | None) ->
     shutil.copy2(_ROOT / "submission_main.py", out_dir / "main.py")
     shutil.copy2(deck, out_dir / "deck.csv")
     shutil.copy2(checkpoint, out_dir / "bc_policy.pt")
+
+    # The calibrated decode threshold travels with the weights. Without it the
+    # bundle silently falls back to the library default, which is fitted to a
+    # different checkpoint — and a too-high threshold makes the agent decline
+    # optional effects rather than crash, so nothing would flag it.
+    meta = checkpoint.with_suffix(checkpoint.suffix + ".meta.json")
+    if meta.is_file():
+        shutil.copy2(meta, out_dir / "bc_policy.pt.meta.json")
+    else:
+        print(
+            f"  WARNING: no {meta.name} — the bundle will use the default decode\n"
+            f"  threshold, which was not calibrated for these weights. Fix with:\n"
+            f"    python archetypes/alakazam/policy_network/bc_train.py "
+            f"--calibrate-only {checkpoint}"
+        )
     for name in _CG_FILES:
         source = _ROOT / "cg" / name
         if source.is_file():

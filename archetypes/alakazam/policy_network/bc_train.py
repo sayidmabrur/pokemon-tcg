@@ -11,8 +11,10 @@ padding/masking is built.
 """
 
 import argparse
+import json
 import random
 import time
+from pathlib import Path
 
 import torch
 import torch.utils.data
@@ -68,6 +70,56 @@ def episode_split(
     for sample_idx, episode_id in enumerate(episode_ids):
         (val_idx if episode_id in val_episodes else train_idx).append(sample_idx)
     return train_idx, val_idx
+
+
+#: Thresholds swept by ``calibrate_threshold``. Weighted toward the low end
+#: because that is where the decision actually lives: with ~1 target option
+#: among N, useful probabilities cluster well below 0.5.
+_THRESHOLD_GRID = (0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50)
+
+
+@torch.no_grad()
+def calibrate_threshold(
+    policy: PolicyNetwork, loader, device: str, grid=_THRESHOLD_GRID
+) -> tuple[float, dict[float, float]]:
+    """Pick the decode threshold that maximises exact-match on held-out data.
+
+    The threshold is not a modelling choice that can be reasoned out once and
+    hardcoded — it depends on how confident this particular checkpoint is,
+    which changes with every training run. Left at a fixed 0.5 it silently
+    turns "take a card" into "decline" on nearly half of the optional
+    selections (see ``DEFAULT_THRESHOLD``), so it is fit on data like any
+    other parameter, on the *validation* split so it isn't fit to noise the
+    model already memorised.
+
+    Returns the best threshold and the full sweep, so a flat curve (nothing
+    to gain) is distinguishable from a sharp peak (worth trusting).
+    """
+    policy.eval()
+    scores = {t: 0 for t in grid}
+    num_samples = 0
+
+    for features, targets in loader:
+        features = _to_device(features, device)
+        targets = targets.to(device)
+        options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
+        logits = policy(features)
+        min_count, max_count = selection_counts(features)
+        expert = [set(t.nonzero().flatten().tolist()) for t in targets]
+        for threshold in grid:
+            predictions = decode_action(
+                logits, options_mask, min_count, max_count, threshold=threshold
+            )
+            scores[threshold] += sum(
+                set(p) == e for p, e in zip(predictions, expert)
+            )
+        num_samples += targets.shape[0]
+
+    policy.train()
+    num_samples = max(num_samples, 1)
+    rates = {t: n / num_samples for t, n in scores.items()}
+    best = max(rates, key=rates.get)
+    return best, rates
 
 
 @torch.no_grad()
@@ -271,8 +323,29 @@ def train(
                 f"(best val exact={best_exact:.3f})",
                 flush=True,
             )
+            # Calibrate the *saved* weights, not the in-memory final-epoch
+            # ones — the threshold has to match the checkpoint that gets
+            # served, and those differ whenever the best epoch wasn't last.
+            policy.load_state_dict(torch.load(out, map_location=device))
+            write_threshold(policy, val_loader, device, out)
 
     return policy
+
+
+def write_threshold(policy: PolicyNetwork, val_loader, device: str, out: str) -> float:
+    """Calibrate and persist the decode threshold next to the weights."""
+    threshold, sweep = calibrate_threshold(policy, val_loader, device)
+    curve = "  ".join(f"{t:.2f}:{rate:.3f}" for t, rate in sorted(sweep.items()))
+    print(f"threshold sweep (exact-match): {curve}", flush=True)
+    meta_path = Path(f"{out}.meta.json")
+    meta_path.write_text(json.dumps({"threshold": threshold}, indent=2) + "\n")
+    print(
+        f"calibrated threshold={threshold:.2f} "
+        f"(exact={sweep[threshold]:.3f} vs {sweep[0.5]:.3f} at the old fixed 0.5) "
+        f"-> {meta_path}",
+        flush=True,
+    )
+    return threshold
 
 
 if __name__ == "__main__":
@@ -300,7 +373,34 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="controls the episode split")
     parser.add_argument("--no-shuffle", action="store_true", help="disable shuffling (debug)")
     parser.add_argument("--cached-row-groups", type=int, default=16)
+    parser.add_argument(
+        "--calibrate-only", default=None, metavar="CHECKPOINT",
+        help="skip training: calibrate an existing checkpoint's decode threshold "
+             "on the validation split and write <CHECKPOINT>.meta.json",
+    )
     args = parser.parse_args()
+
+    if args.calibrate_only:
+        # Same split (same --seed) the checkpoint was trained under, so the
+        # calibration set stays genuinely held out.
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        dataset = PolicyFeatureDataset(
+            args.parquet, player_name=args.player_name, transform=transform,
+            cached_row_groups=args.cached_row_groups,
+        )
+        _, val_idx = episode_split(dataset, args.val_frac, args.seed)
+        if not val_idx:
+            raise SystemExit("--val-frac 0 leaves nothing to calibrate on")
+        val_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dataset, val_idx), batch_size=args.batch_size,
+            shuffle=False, collate_fn=collate_batch, num_workers=args.num_workers,
+        )
+        policy = PolicyNetwork().to(device)
+        policy.load_state_dict(torch.load(args.calibrate_only, map_location=device))
+        print(f"calibrating {args.calibrate_only} on {len(val_idx)} held-out samples",
+              flush=True)
+        write_threshold(policy, val_loader, device, args.calibrate_only)
+        raise SystemExit(0)
 
     # Saving lives inside train() now: with a validation split, the
     # checkpoint worth keeping is the best epoch, which only the loop knows.

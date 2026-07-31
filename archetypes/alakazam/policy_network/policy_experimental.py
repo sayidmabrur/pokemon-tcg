@@ -409,12 +409,54 @@ def masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Ten
     return (per_option * mask).sum() / mask.sum().clamp(min=1)
 
 
+#: Probability above which an option is selected. NOT 0.5 — that value only
+#: makes sense for a balanced binary decision, and this is not one. The
+#: training target is ~1 selected option out of N, so a well-fit model
+#: spreads its probability mass across the candidates: on decisions where the
+#: expert really did take a card, the *highest* scoring option has a median
+#: probability of ~0.57, and 44% of such decisions have no option above 0.5
+#: at all. Decoding those at 0.5 returns an empty selection, which is legal
+#: whenever ``minCount == 0`` and therefore fails silently — the card gets
+#: played and its effect is declined. Measured against the expert, who
+#: declines optional selections only 2.1% of the time, that is nearly always
+#: the wrong call.
+#:
+#: This default is the value calibrated on held-out data (see
+#: ``bc_train.calibrate_threshold``); a checkpoint's own calibrated value
+#: travels beside it in ``<checkpoint>.meta.json`` and takes precedence, since
+#: the right threshold depends on how well that particular model is fit.
+DEFAULT_THRESHOLD = 0.15
+
+
+def load_policy(checkpoint, map_location="cpu") -> tuple["PolicyNetwork", float]:
+    """Load weights plus the decode threshold calibrated for them.
+
+    Threshold and weights are a matched pair — serving a checkpoint under a
+    threshold calibrated for a different one reintroduces exactly the
+    silent-decline bug this pairing exists to prevent — so they are loaded
+    together rather than left to each call site to remember.
+    """
+    import json
+    from pathlib import Path
+
+    checkpoint = Path(checkpoint)
+    network = PolicyNetwork()
+    network.load_state_dict(torch.load(checkpoint, map_location=map_location))
+    network.eval()
+
+    threshold = DEFAULT_THRESHOLD
+    meta_path = checkpoint.with_suffix(checkpoint.suffix + ".meta.json")
+    if meta_path.is_file():
+        threshold = float(json.loads(meta_path.read_text())["threshold"])
+    return network, threshold
+
+
 def decode_action(
     logits: torch.Tensor,
     options_mask: torch.Tensor,
     min_count: torch.Tensor,
     max_count: torch.Tensor,
-    threshold: float = 0.5,
+    threshold: float = DEFAULT_THRESHOLD,
 ) -> list[list[int]]:
     """Turn a batch of option logits into the actual selections to submit.
 

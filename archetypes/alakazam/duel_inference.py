@@ -40,7 +40,7 @@ from crustle_rule_based_agent import PolicyRuleBased
 from collate import collate_features
 from dataset import transform
 from live import LiveFeatureExtractor
-from policy_experimental import PolicyNetwork, decode_action, selection_counts
+from policy_experimental import decode_action, load_policy, selection_counts
 
 
 def read_deck(path: Path) -> list[int]:
@@ -60,18 +60,17 @@ class BCPolicy:
     """
 
     def __init__(self, checkpoint: Path) -> None:
-        self.network = PolicyNetwork()
-        if checkpoint.is_file():
-            self.network.load_state_dict(torch.load(checkpoint, map_location="cpu"))
-            print(f"[BCPolicy] loaded {checkpoint}")
-        else:
+        if not checkpoint.is_file():
             raise SystemExit(
                 f"no checkpoint at {checkpoint} — train one with "
                 f"policy_network/bc_train.py, or pass --checkpoint"
             )
-        self.network.eval()
+        # Weights and threshold load together — see load_policy.
+        self.network, self.threshold = load_policy(checkpoint)
+        print(f"[BCPolicy] loaded {checkpoint} (decode threshold {self.threshold:.2f})")
         self.extractor = LiveFeatureExtractor()
         self.decisions = 0
+        self.empty_selections = 0
 
     def reset(self, episode_id: int) -> None:
         self.extractor.reset(episode_id=episode_id)
@@ -83,9 +82,16 @@ class BCPolicy:
             logits = self.network(features)
         min_count, max_count = selection_counts(features)
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        action = decode_action(logits, options_mask, min_count, max_count)[0]
+        action = decode_action(
+            logits, options_mask, min_count, max_count, threshold=self.threshold
+        )[0]
         self.extractor.record_action(action)
         self.decisions += 1
+        # An empty selection is legal only when minCount is 0, and it means
+        # "decline this effect" — the failure mode a mis-set threshold causes,
+        # so it is counted rather than left invisible.
+        if not action:
+            self.empty_selections += 1
         return action
 
 
@@ -225,6 +231,15 @@ def main() -> None:
         results[name] = totals
 
     print("\n" + "=" * 62)
+    bc = contenders[0][1]
+    if bc.decisions:
+        rate = bc.empty_selections / bc.decisions
+        print(
+            f"declined effects: {bc.empty_selections}/{bc.decisions} decisions "
+            f"({rate:.1%}) selected nothing — the expert declines ~2% of "
+            f"optional selections, so a rate far above that means the decode "
+            f"threshold is too high (see bc_train.calibrate_threshold)"
+        )
     for name, totals in results.items():
         low, high = wilson(totals["wins"], totals["episodes"])
         print(
