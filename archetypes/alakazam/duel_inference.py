@@ -4,7 +4,6 @@ imitation-learned ``PolicyNetwork`` (trained via ``policy_network/bc_train.py``)
 so you can watch the BC policy actually play against ``PolicyRuleBased``.
 """
 
-import random
 import sys
 from pathlib import Path
 from pprint import pprint
@@ -24,11 +23,15 @@ from crustle_rule_based_agent import PolicyRuleBased
 
 from live import LiveFeatureExtractor
 from dataset import transform
-from policy_experimental import PolicyNetwork
+from policy_experimental import PolicyNetwork, decode_action, selection_counts
 from collate import collate_features
 
 
-episodes = 10
+# 10 games is not enough to conclude anything: at a true 50% win rate, a
+# 10-game sample lands anywhere from 2 to 8 wins routinely, so a "3/10"
+# result is indistinguishable from an even matchup. Override on the command
+# line when you want a quick smoke run.
+episodes = int(sys.argv[1]) if len(sys.argv) > 1 else 100
 
 p0 = read_deck_csv()
 p1 = read_deck_csv()
@@ -67,12 +70,18 @@ class BCPolicy:
         # live decision into a batch of 1.
         features = collate_features([transform(observation)])
         with torch.no_grad():
-            logits = self.policy(features)[0]  # (max_options,)
+            logits = self.policy(features)
 
-        select = obs["select"]
-        num_valid = int(torch.isfinite(logits).sum().item())
-        count = min(random.randint(select["minCount"], select["maxCount"]), num_valid)
-        return torch.topk(logits, count).indices.tolist()
+        # ``decode_action`` is the decode the per-option sigmoid objective in
+        # bc_train.py was actually trained for, and is the same function the
+        # validation ``exact`` metric is computed with — so the win rate
+        # measured here and the accuracy reported during training refer to
+        # the same policy. It reads the [minCount, maxCount] bracket out of
+        # the batch itself rather than off ``obs``, which keeps it identical
+        # to the offline path; they carry the same numbers.
+        min_count, max_count = selection_counts(features)
+        options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
+        return decode_action(logits, options_mask, min_count, max_count)[0]
 
 
 rule_based_policy = PolicyRuleBased()
@@ -139,3 +148,25 @@ for i in range(episodes):
     print(f"Episode {i+1}/{episodes} finished in {step} steps. Winner: {winner}")
 print("rule_based_policy win:", p0_win)
 print("rl_policy win:", p1_win)
+
+# Report the win rate with its uncertainty, so a run isn't over-read: two
+# results whose intervals overlap have not been shown to differ.
+#
+# Wilson rather than the textbook normal approximation, because the
+# interesting results here sit near 0% (and, hopefully, later near 100%),
+# which is exactly where the normal approximation breaks: at 0 wins it
+# computes a half-width of literally zero and claims perfect certainty from
+# a handful of games. Wilson stays honest at the boundaries.
+total = p0_win + p1_win
+if total:
+    win_rate = p1_win / total
+    z = 1.96
+    denominator = 1 + z**2 / total
+    center = (win_rate + z**2 / (2 * total)) / denominator
+    spread = (
+        z / denominator * (win_rate * (1 - win_rate) / total + z**2 / (4 * total**2)) ** 0.5
+    )
+    print(
+        f"rl_policy win rate: {win_rate:.1%} "
+        f"(95% CI {max(center - spread, 0):.1%}–{min(center + spread, 1):.1%}, n={total})"
+    )

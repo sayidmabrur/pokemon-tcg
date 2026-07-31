@@ -409,6 +409,61 @@ def masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Ten
     return (per_option * mask).sum() / mask.sum().clamp(min=1)
 
 
+def decode_action(
+    logits: torch.Tensor,
+    options_mask: torch.Tensor,
+    min_count: torch.Tensor,
+    max_count: torch.Tensor,
+    threshold: float = 0.5,
+) -> list[list[int]]:
+    """Turn a batch of option logits into the actual selections to submit.
+
+    The training objective (``masked_bce_loss``) is a *per-option* sigmoid:
+    it teaches "is this option part of the selection?", one option at a
+    time. The matching decode is therefore a threshold — take every option
+    the model is more than ``threshold`` confident about — and NOT a
+    top-``k`` for some externally chosen ``k``. Picking ``k`` some other way
+    (a fixed number, or worse a random one) throws away the only thing the
+    count-relevant part of the model learned, and makes the policy's
+    behaviour inconsistent with what the loss was ever scored on.
+
+    The engine still imposes a hard ``[minCount, maxCount]`` bracket per
+    decision, so the thresholded count is clamped into it, and further
+    clamped to the number of genuinely valid options. Within the clamp,
+    options are taken in descending confidence — so when the threshold
+    under-selects, the next-most-confident options fill the gap, and when it
+    over-selects, the least confident ones are dropped first.
+
+    Returns one list of option indexes per batch element (unlike the rest of
+    this module it is not a tensor, because the counts are ragged).
+    """
+    probs = torch.sigmoid(logits).masked_fill(~options_mask, -1.0)
+    num_valid = options_mask.sum(-1)
+
+    count = (probs > threshold).sum(-1)
+    count = torch.maximum(count, min_count)
+    count = torch.minimum(count, max_count)
+    count = torch.minimum(count, num_valid).clamp(min=0)
+
+    order = probs.argsort(dim=-1, descending=True)
+    return [order[i, : int(count[i])].tolist() for i in range(order.shape[0])]
+
+
+def selection_counts(features: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover the raw ``(minCount, maxCount)`` bracket of the *current*
+    decision from a collated feature batch, as ``(B,)`` long tensors.
+
+    ``dataset.transform`` stores them ``_normalize``d by the fixed
+    ``min_count``/``max_count`` cap of 60 (deck size), and carries a length-1
+    "chain" dim for the single current decision — this undoes both, so
+    ``decode_action`` can be fed straight from a batch without the caller
+    having to know that encoding."""
+    selection = features["decision_context"]["selection"]
+    min_count = (selection["min_count"] * 60.0).round().long().reshape(-1)
+    max_count = (selection["max_count"] * 60.0).round().long().reshape(-1)
+    return min_count, max_count
+
+
 class PolicyNetwork(nn.Module):
     """Fuses every feature group into one state vector, then scores the
     current decision's options against it (a pointer-style classifier over

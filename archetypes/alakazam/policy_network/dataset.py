@@ -139,6 +139,21 @@ class PolicyFeatureDataset(Dataset):
         """
         return idx if self._row_indexes is None else self._row_indexes[idx]
 
+    def episode_ids(self) -> list[Any]:
+        """The episode id of every *sample*, in sample-index order.
+
+        Exists so a train/validation split can be grouped by match rather
+        than by row: consecutive rows of one game share almost all of their
+        board state, and ``decision_chain``/``opponent_history`` explicitly
+        scan backwards over earlier rows of the same episode — so splitting
+        row-wise puts near-copies of a validation sample (and its own
+        history) in the training set, and the validation score stops
+        measuring generalisation at all."""
+        column = self._parquet.read(columns=["episode_id"]).to_pandas()["episode_id"]
+        if self._row_indexes is None:
+            return column.tolist()
+        return column.iloc[self._row_indexes].tolist()
+
     @staticmethod
     def _touch(cache: OrderedDict, key: int, value: Any, limit: int) -> Any:
         """Insert ``key`` as the most recently used entry, evicting the oldest."""
