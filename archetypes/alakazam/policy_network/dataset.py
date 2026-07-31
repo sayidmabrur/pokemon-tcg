@@ -9,7 +9,7 @@ from bisect import bisect_right
 import torch
 from torch.utils.data import Dataset
 
-from features import decision_chain, extract_features, opponent_history
+from observation import DEFAULT_SPEC, ObservationSpec, build_observation
 from vocab import (
     EnergyType,
     OptionsVocab,
@@ -73,10 +73,11 @@ class PolicyFeatureDataset(Dataset):
         self,
         parquet_path: str | Path,
         transform: Callable[[dict[str, Any]], Any] | None = None,
-        opponent_history_size: int = 60,
-        decision_chain_size: int = 60,
+        opponent_history_size: int | None = None,
+        decision_chain_size: int | None = None,
         player_name: str | Iterable[str] | None = None,
         cached_row_groups: int = 4,
+        spec: ObservationSpec = DEFAULT_SPEC,
     ) -> None:
         try:
             import pyarrow.parquet as pq
@@ -112,8 +113,18 @@ class PolicyFeatureDataset(Dataset):
         self._row_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._row_cache_size = 4096
         self.transform = transform
-        self.opponent_history_size = opponent_history_size
-        self.decision_chain_size = decision_chain_size
+        # The sizes are part of the observation contract, so they live on the
+        # spec. They stay accepted as direct arguments because callers and
+        # tests already pass them, but the spec is the single source of truth
+        # — and it is what should be persisted alongside a checkpoint, since
+        # a model served under a different spec is being fed a different
+        # input than it was trained on.
+        overrides = {}
+        if opponent_history_size is not None:
+            overrides["opponent_history_size"] = opponent_history_size
+        if decision_chain_size is not None:
+            overrides["decision_chain_size"] = decision_chain_size
+        self.spec = spec.variant(**overrides) if overrides else spec
         self.player_name = player_name
 
         self._row_indexes: list[int] | None = None
@@ -191,27 +202,14 @@ class PolicyFeatureDataset(Dataset):
 
         idx = self.raw_index(sample_idx)
         row = self._read_row(idx)
-        player_index = row["player_index"]
-        features = extract_features(
-            row["state"], row["selection"], row["options"], player_index
-        )
-        if self.opponent_history_size > 0:
-            features["opponent_history"] = opponent_history(
-                self._read_row, idx, row, self.opponent_history_size
-            )
-        if self.decision_chain_size > 0:
-            features["decision_chain"] = decision_chain(
-                self._read_row, idx, row, self.decision_chain_size
-            )
-        meta = {
-            "episode_id": row["episode_id"],
-            "frame_index": row["frame_index"],
-            "player_index": player_index,
-            "player_name": row["player_name"],
-        }
-        observation = {"features": features, "meta": meta}
+        # Assembly lives in observation.py so this path and live.py cannot
+        # drift; all this class contributes is where the rows come from.
+        observation = build_observation(self._read_row, idx, row, self.spec)
         if self.transform is not None:
-            observation = {"features": self.transform(observation), "meta": meta}
+            observation = {
+                "features": self.transform(observation),
+                "meta": observation["meta"],
+            }
         return observation, torch.tensor(row["target_action"], dtype=torch.long)
 
 

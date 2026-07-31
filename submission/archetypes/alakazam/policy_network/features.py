@@ -236,25 +236,48 @@ def opponent_history(
     idx: int,
     row: dict[str, Any],
     size: int,
+    source: str = "own_frames",
 ) -> list[dict[str, Any]]:
-    """Scan backward from ``idx`` collecting the opponent's board state at the
-    last frame seen for each of their most recent ``size`` turns, then diff
-    consecutively (oldest first).
+    """Scan backward from ``idx`` collecting the opponent's board state once
+    per turn for the most recent ``size`` turns, then diff consecutively
+    (oldest first).
 
     Rows for one episode are contiguous in ascending frame order, so this is a
     plain backward walk, not a search.  The first captured turn is diffed
     against ``EMPTY_BOARD_STATE`` so every entry has the same shape.
 
+    ``source`` chooses *which frames* the snapshots are taken at — see
+    ``observation.py``, which owns that choice and passes it down:
+
+    ``"opponent_frames"`` snapshots at the opponent's own decision frames,
+    giving roughly one entry per opponent turn.  Requires the opponent's
+    frames to be present in the row sequence at all, which holds for recorded
+    replays but not for a policy invoked only for its own decisions.
+
+    ``"own_frames"`` snapshots at *this* player's frames instead, so each
+    entry becomes "how their board changed since I last acted".  The
+    opponent's board is public, so this is always observable — a player can
+    read the other side of the table without being told what was chosen to
+    get there.
+
+    Either way the snapshot is ``board_state(..., opponent_index)``: the
+    subject is always the opponent's board.  Only the sampling instants
+    differ.
+
     Note the engine's ``turn`` counter increments once per *player* turn, so
-    grouping by it usually yields one snapshot per opponent turn.  The
-    exception is a forced opponent reaction interjected during our own turn:
-    that produces a snapshot labelled with our turn number.  It stays
-    chronologically ordered and shape-consistent, so the diffs remain valid —
-    they just aren't strictly end-of-their-turn boundaries.
+    grouping by it usually yields one snapshot per turn of the chosen actor.
+    The exception is a forced reaction interjected during the other player's
+    turn: that produces a snapshot labelled with the other player's turn
+    number.  It stays chronologically ordered and shape-consistent, so the
+    diffs remain valid — they just aren't strictly end-of-turn boundaries.
     """
     if size <= 0:
         return []
-    episode_id, opponent_index = row["episode_id"], 1 - row["player_index"]
+    episode_id, player_index = row["episode_id"], row["player_index"]
+    opponent_index = 1 - player_index
+    # The board captured is the opponent's in both modes; this is whose
+    # *frames* we sample it at.
+    frame_owner = opponent_index if source == "opponent_frames" else player_index
     snapshots: list[tuple[int, dict[str, Any]]] = []
     seen_turns: set[int] = set()
     cursor = idx - 1
@@ -265,7 +288,7 @@ def opponent_history(
         turn = prior["state"]["turn"]
         # Scanning backward, the first frame seen for a given turn is that
         # turn's *last* frame chronologically — the final board for that turn.
-        if prior["player_index"] == opponent_index and turn not in seen_turns:
+        if prior["player_index"] == frame_owner and turn not in seen_turns:
             seen_turns.add(turn)
             snapshots.append((turn, board_state(prior["state"], opponent_index)))
         cursor -= 1

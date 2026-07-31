@@ -1,172 +1,253 @@
-"""Adapted from the repo-root ``duel_inference.py`` — same rule-based-vs-RL
-duel loop, but the placeholder ``RandomPolicy`` is swapped for the
-imitation-learned ``PolicyNetwork`` (trained via ``policy_network/bc_train.py``),
-so you can watch the BC policy actually play against ``PolicyRuleBased``.
+"""Measure the imitation-learned ``PolicyNetwork`` against ``PolicyRuleBased``.
+
+Run it::
+
+    python archetypes/alakazam/duel_inference.py --episodes 100
+
+The BC policy is driven through the *same* observation path the submission
+uses, deliberately: its ``LiveFeatureExtractor`` is fed only its own
+decisions, never the opponent's, exactly as ``agent()`` is invoked in the
+competition harness. Under the default ``own_frames`` spec that is provably
+equivalent to feeding it both sides (``policy_network/test_parity.py``
+checks it decision-by-decision), so nothing is lost — but wiring it this way
+means the number printed here is a measurement of the thing that actually
+gets submitted, not of a better-informed variant of it.
+
+Both seats play the same deck, so the win rate isolates policy strength from
+deck strength. It defaults to ``alakazam_deck.csv``, the list reconstructed
+from the replays the policy was cloned from; playing anything else hands the
+network cards it never saw its expert play, which measures the mismatch
+rather than the policy.
 """
 
+import argparse
+import random
 import sys
 from pathlib import Path
-from pprint import pprint
 
 import torch
 
-# This file lives in archetypes/alakazam/ (not the repo root, like the
-# original), so the repo root isn't on sys.path by default — needed for
-# ``main``/``cg.game``/``crustle_rule_based_agent``.
+# This file lives in archetypes/alakazam/ (not the repo root), so the repo
+# root isn't on sys.path by default — needed for ``main``/``cg.game``/
+# ``crustle_rule_based_agent``.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).parent / "policy_network"))
 
-from main import read_deck_csv
 from cg.game import battle_finish, battle_select, battle_start
 from crustle_rule_based_agent import PolicyRuleBased
 
-from live import LiveFeatureExtractor
-from dataset import transform
-from policy_experimental import PolicyNetwork, decode_action, selection_counts
 from collate import collate_features
+from dataset import transform
+from live import LiveFeatureExtractor
+from policy_experimental import PolicyNetwork, decode_action, selection_counts
 
 
-# 10 games is not enough to conclude anything: at a true 50% win rate, a
-# 10-game sample lands anywhere from 2 to 8 wins routinely, so a "3/10"
-# result is indistinguishable from an even matchup. Override on the command
-# line when you want a quick smoke run.
-episodes = int(sys.argv[1]) if len(sys.argv) > 1 else 100
-
-p0 = read_deck_csv()
-p1 = read_deck_csv()
+def read_deck(path: Path) -> list[int]:
+    lines = [line for line in path.read_text().split("\n") if line.strip()]
+    if len(lines) != 60:
+        raise SystemExit(f"{path} has {len(lines)} cards; the engine requires exactly 60")
+    return [int(line) for line in lines]
 
 
 class BCPolicy:
-    """Wraps the trained imitation-learning ``PolicyNetwork`` behind the same
-    ``.act(obs) -> list[int]`` interface as ``PolicyRuleBased``.
+    """The trained network behind a ``.act(obs) -> list[int]`` interface.
 
-    Unlike ``PolicyRuleBased`` (which reads straight off ``obs``), this needs
-    the *featurised* observation — but the duel loop already runs one shared
-    ``LiveFeatureExtractor`` per decision (both players' history depends on
-    seeing each other's frames — see ``live.py``), so this reuses that
-    already-computed ``observation`` rather than extracting its own (a second
-    extractor instance would double-append rows and break the decision_chain/
-    opponent_history scans).
+    Owns its own extractor and is fed only its own decisions — see the module
+    docstring. That self-containment is the point: it makes this class a drop-in
+    for ``PolicyRuleBased`` and keeps the duel loop from having to know
+    anything about feature extraction.
     """
 
-    def __init__(self, checkpoint: str | None = None):
-        self.policy = PolicyNetwork()
-        # Resolve relative to this file, not the process's cwd — otherwise
-        # where the checkpoint is found depends on which directory you
-        # happened to launch the script from.
-        if checkpoint is None:
-            checkpoint_path = Path(__file__).parent / "policy_network" / "bc_policy.pt"
+    def __init__(self, checkpoint: Path) -> None:
+        self.network = PolicyNetwork()
+        if checkpoint.is_file():
+            self.network.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+            print(f"[BCPolicy] loaded {checkpoint}")
         else:
-            checkpoint_path = Path(checkpoint)
-        if checkpoint_path.is_file():
-            self.policy.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-        else:
-            print(f"[BCPolicy] no checkpoint at {checkpoint_path} — using randomly initialized weights")
-        self.policy.eval()
+            raise SystemExit(
+                f"no checkpoint at {checkpoint} — train one with "
+                f"policy_network/bc_train.py, or pass --checkpoint"
+            )
+        self.network.eval()
+        self.extractor = LiveFeatureExtractor()
+        self.decisions = 0
 
-    def act(self, obs: dict, observation: dict) -> list[int]:
-        # PolicyNetwork is batch-only (see collate.py) — wrap this single
-        # live decision into a batch of 1.
+    def reset(self, episode_id: int) -> None:
+        self.extractor.reset(episode_id=episode_id)
+
+    def act(self, obs: dict) -> list[int]:
+        observation = self.extractor(obs)
         features = collate_features([transform(observation)])
         with torch.no_grad():
-            logits = self.policy(features)
-
-        # ``decode_action`` is the decode the per-option sigmoid objective in
-        # bc_train.py was actually trained for, and is the same function the
-        # validation ``exact`` metric is computed with — so the win rate
-        # measured here and the accuracy reported during training refer to
-        # the same policy. It reads the [minCount, maxCount] bracket out of
-        # the batch itself rather than off ``obs``, which keeps it identical
-        # to the offline path; they carry the same numbers.
+            logits = self.network(features)
         min_count, max_count = selection_counts(features)
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        return decode_action(logits, options_mask, min_count, max_count)[0]
+        action = decode_action(logits, options_mask, min_count, max_count)[0]
+        self.extractor.record_action(action)
+        self.decisions += 1
+        return action
 
 
-rule_based_policy = PolicyRuleBased()
-# The repo-root copy (earliest timestamp of the 3 on disk) is the one that
-# predates the later debug/smoke-test runs which clobbered the
-# policy_network/ copy with a throwaway 1000-sample checkpoint — this is
-# the real ~5-hour trained one.
-rl_policy = BCPolicy(checkpoint=str(_REPO_ROOT / "bc_policy.pt"))
+class RandomPolicy:
+    """Control condition. Without it a win rate has no floor to be read
+    against: "the network beats the rule-based agent 12% of the time" only
+    means something next to what picking legal moves at random scores."""
 
+    def reset(self, episode_id: int) -> None:
+        pass
 
-policies = [rule_based_policy, rl_policy]
-
-# One shared extractor: both players' decisions belong to the same
-# observation stream, and building either side's opponent history needs the
-# other side's frames.  It reads yourIndex per obs, so it stays correct.
-feature_extractor = LiveFeatureExtractor()
-
-trajectories = {0: [], 1: []}
-
-# result = -1 means that the game is running
-p0_win = 0
-p1_win = 0
-for i in range(episodes):
-    step = 1
-    obs, start_data = battle_start(p0, p1)
-    feature_extractor.reset(episode_id=i)
-    j = 0
-    step_p1 = 0
-    while obs["current"]["result"] == -1:
-        player_idx = obs["current"]["yourIndex"]
-        policy = policies[player_idx]
+    def act(self, obs: dict) -> list[int]:
         select = obs["select"]
-        option = select["option"]
+        count = min(
+            random.randint(select["minCount"], select["maxCount"]), len(select["option"])
+        )
+        return random.sample(range(len(select["option"])), count)
 
-        # Call the extractor exactly once per decision: each call appends a
-        # row to the episode memory that decision_chain/opponent_history scan.
-        observation = feature_extractor(obs)
-        if player_idx == 1:
-            observation_p1 = observation
-            step_p1 = step_p1 + 1
-            # print("observation:")
-            # pprint(observation)
-        if isinstance(policy, BCPolicy):
-            action = policy.act(obs, observation)
-        else:
-            action = policy.act(obs)
-        feature_extractor.record_action(action)
-        trajectories[player_idx].append((observation, action))
-        obs = battle_select(action)
-        step += 1
-        # if j ==50:
-            # break
-        # j=j+1
 
-    result = obs["current"]["result"]
-    battle_finish()
-
-    if result == 0:
-        p0_win += 1
-    else:
-        p1_win += 1
-    # break
-    winner = "p0" if result == 0 else "p1"
-    print(f"Episode {i+1}/{episodes} finished in {step} steps. Winner: {winner}")
-print("rule_based_policy win:", p0_win)
-print("rl_policy win:", p1_win)
-
-# Report the win rate with its uncertainty, so a run isn't over-read: two
-# results whose intervals overlap have not been shown to differ.
-#
-# Wilson rather than the textbook normal approximation, because the
-# interesting results here sit near 0% (and, hopefully, later near 100%),
-# which is exactly where the normal approximation breaks: at 0 wins it
-# computes a half-width of literally zero and claims perfect certainty from
-# a handful of games. Wilson stays honest at the boundaries.
-total = p0_win + p1_win
-if total:
-    win_rate = p1_win / total
+def wilson(wins: int, total: int) -> tuple[float, float]:
+    """95% CI for a win rate. Wilson rather than the normal approximation,
+    which collapses to zero width at 0 or 100% — precisely the results worth
+    being careful about here."""
+    if not total:
+        return 0.0, 1.0
+    rate = wins / total
     z = 1.96
     denominator = 1 + z**2 / total
-    center = (win_rate + z**2 / (2 * total)) / denominator
-    spread = (
-        z / denominator * (win_rate * (1 - win_rate) / total + z**2 / (4 * total**2)) ** 0.5
+    center = (rate + z**2 / (2 * total)) / denominator
+    spread = z / denominator * (rate * (1 - rate) / total + z**2 / (4 * total**2)) ** 0.5
+    return max(center - spread, 0.0), min(center + spread, 1.0)
+
+
+def duel(
+    challenger, deck: list[int], opponent_deck: list[int],
+    episodes: int, seat: int, quiet: bool,
+) -> dict:
+    """Play ``episodes`` matches of ``challenger`` vs ``PolicyRuleBased``.
+
+    ``seat`` decides which side the challenger sits on. It matters: the
+    engine gives the first player a real advantage, so a win rate measured
+    from one seat only is partly a measurement of that seat.
+
+    The two decks are separate because ``PolicyRuleBased`` is written for one
+    specific decklist — its heuristics reference card ids directly. Handing it
+    the Alakazam list makes it play badly for reasons that have nothing to do
+    with how good the BC policy is, which would inflate the win rate.
+    """
+    opponent = PolicyRuleBased()
+    policies = [None, None]
+    policies[seat] = challenger
+    policies[1 - seat] = opponent
+    decks = [None, None]
+    decks[seat] = deck
+    decks[1 - seat] = opponent_deck
+
+    wins = 0
+    steps = []
+    for episode in range(episodes):
+        obs, _ = battle_start(decks[0], decks[1])
+        challenger.reset(episode_id=episode)
+        step = 0
+        while obs["current"]["result"] == -1:
+            player_index = obs["current"]["yourIndex"]
+            action = policies[player_index].act(obs)
+            obs = battle_select(action)
+            step += 1
+        result = obs["current"]["result"]
+        battle_finish()
+
+        if result == seat:
+            wins += 1
+        steps.append(step)
+        if not quiet:
+            won = "W" if result == seat else "L"
+            print(f"  episode {episode + 1}/{episodes}: {won} ({step} steps)")
+
+    low, high = wilson(wins, episodes)
+    return {
+        "wins": wins, "episodes": episodes, "rate": wins / max(episodes, 1),
+        "ci": (low, high), "mean_steps": sum(steps) / max(len(steps), 1),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--deck", default=str(_REPO_ROOT / "alakazam_deck.csv"))
+    parser.add_argument(
+        "--opponent-deck", default=None,
+        help="deck for PolicyRuleBased; defaults to --deck (mirror match, which "
+             "isolates policy strength but hands the rule-based agent a deck its "
+             "hardcoded heuristics were not written for). Pass deck.csv to let it "
+             "pilot its own list — the fairer opponent, though deck strength then "
+             "contributes to the result too. Worth running both.",
     )
-    print(
-        f"rl_policy win rate: {win_rate:.1%} "
-        f"(95% CI {max(center - spread, 0):.1%}–{min(center + spread, 1):.1%}, n={total})"
+    parser.add_argument("--checkpoint", default=str(_REPO_ROOT / "checkpoints/bc_policy.pt"))
+    parser.add_argument(
+        "--seats", default="both", choices=("0", "1", "both"),
+        help="which seat the policy plays; 'both' splits the episodes and "
+             "reports each, since going first is an advantage",
     )
+    parser.add_argument(
+        "--no-baseline", action="store_true",
+        help="skip the random-policy control (it is what makes the BC number readable)",
+    )
+    parser.add_argument("--quiet", action="store_true", help="suppress per-episode lines")
+    args = parser.parse_args()
+
+    deck = read_deck(Path(args.deck))
+    opponent_deck = read_deck(Path(args.opponent_deck)) if args.opponent_deck else deck
+    print(f"deck:          {args.deck} ({len(set(deck))} distinct cards)")
+    print(f"opponent deck: {args.opponent_deck or args.deck} "
+          f"({len(set(opponent_deck))} distinct cards)")
+
+    seats = [0, 1] if args.seats == "both" else [int(args.seats)]
+    per_seat = max(1, args.episodes // len(seats))
+
+    contenders = [("BC policy", BCPolicy(Path(args.checkpoint)))]
+    if not args.no_baseline:
+        contenders.append(("random  ", RandomPolicy()))
+
+    print()
+    results = {}
+    for name, policy in contenders:
+        totals = {"wins": 0, "episodes": 0}
+        for seat in seats:
+            print(f"{name} as player {seat}, {per_seat} episodes vs PolicyRuleBased")
+            outcome = duel(policy, deck, opponent_deck, per_seat, seat, args.quiet)
+            low, high = outcome["ci"]
+            print(
+                f"  -> {outcome['wins']}/{outcome['episodes']} = {outcome['rate']:.1%} "
+                f"(95% CI {low:.1%}-{high:.1%}), {outcome['mean_steps']:.0f} steps/game"
+            )
+            totals["wins"] += outcome["wins"]
+            totals["episodes"] += outcome["episodes"]
+        results[name] = totals
+
+    print("\n" + "=" * 62)
+    for name, totals in results.items():
+        low, high = wilson(totals["wins"], totals["episodes"])
+        print(
+            f"{name}: {totals['wins']}/{totals['episodes']} = "
+            f"{totals['wins'] / max(totals['episodes'], 1):.1%} "
+            f"(95% CI {low:.1%}-{high:.1%})"
+        )
+
+    if "random  " in results and "BC policy" in results:
+        bc, rnd = results["BC policy"], results["random  "]
+        bc_low, _ = wilson(bc["wins"], bc["episodes"])
+        _, rnd_high = wilson(rnd["wins"], rnd["episodes"])
+        # Non-overlapping intervals is a deliberately conservative test: it
+        # under-reports significance, so clearing it is meaningful while
+        # failing it means "not shown", not "no difference".
+        if bc_low > rnd_high:
+            print("\nThe BC policy beats the random baseline (intervals do not overlap).")
+        else:
+            print(
+                "\nThe BC policy is NOT distinguishable from random at this sample "
+                "size — either it hasn't learned to play, or more episodes are needed."
+            )
+
+
+if __name__ == "__main__":
+    main()

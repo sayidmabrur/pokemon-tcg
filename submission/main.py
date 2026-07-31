@@ -29,16 +29,31 @@ import random
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent
+try:
+    _ROOT = Path(__file__).resolve().parent
+except NameError:
+    # ``kaggle_environments`` does not import this file — it reads the source
+    # and ``exec``s it against a bare globals dict, which has no ``__file__``.
+    # Touching it unguarded raises NameError at module level, before any
+    # fallback inside agent() could ever run, so the whole submission fails
+    # to load rather than merely playing badly.
+    _ROOT = Path("/kaggle_simulations/agent")
+    if not _ROOT.is_dir():
+        _ROOT = Path.cwd()
 # The competition unpacks the bundle at a fixed path; when the harness runs
 # from some other working directory the plain relative import still has to
 # resolve, so the bundle root goes on sys.path explicitly.
+# Each directory is tested independently: the bundle root is often already
+# on sys.path (Python puts the running script's directory there), and
+# short-circuiting on that would skip the policy directory too — which is
+# not implied by it, since the policy modules import each other by bare name
+# rather than as a package.
 for _candidate in (_ROOT, Path("/kaggle_simulations/agent")):
-    if _candidate.is_dir() and str(_candidate) not in sys.path:
-        sys.path.insert(0, str(_candidate))
-        _policy_dir = _candidate / "archetypes/alakazam/policy_network"
-        if _policy_dir.is_dir():
-            sys.path.insert(0, str(_policy_dir))
+    if not _candidate.is_dir():
+        continue
+    for _entry in (_candidate, _candidate / "archetypes/alakazam/policy_network"):
+        if _entry.is_dir() and str(_entry) not in sys.path:
+            sys.path.insert(0, str(_entry))
 
 from cg.api import Observation, to_observation_class
 

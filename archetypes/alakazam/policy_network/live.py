@@ -12,35 +12,42 @@ Usage in a self-play/eval loop::
         feature_extractor.record_action(action)   # so it lands in decision_chain
         obs = battle_select(action)
 
-Both ``opponent_history`` and ``decision_chain`` span the whole match: the
-history is one board diff per opponent turn, the chain is this player's own
-last ``decision_chain_size`` decisions from their own perspective.
+Both ``opponent_history`` and ``decision_chain`` span the whole match, so
+they need memory of earlier decisions, which a single ``obs`` doesn't carry.
+This class keeps that memory as a list of rows in the *same* shape
+``convert_replays.py`` writes to Parquet, then hands them to
+``observation.build_observation`` — the identical call ``dataset.py`` makes.
+Assembling features is deliberately not this module's job: sharing one
+implementation is what makes offline and live features the same by
+construction rather than by two implementations happening to agree.
 
-They need memory of earlier decisions
-in the episode, which a single ``obs`` doesn't carry.  This class keeps that
-memory as a list of rows in the *same* shape ``convert_replays.py`` writes to
-Parquet, and runs the identical ``features.opponent_history`` /
-``features.decision_chain`` scans over it — so a policy sees bit-for-bit the
-same transform offline and live.
-
-Both players' decisions go through one extractor: it's a single observation
-stream, and building either player's opponent history requires having seen
-the other player's frames.  ``__call__`` derives the deciding player from
-``obs["current"]["yourIndex"]``, so the shared instance is correct for both.
+Feeding it both players' decisions is optional, and which to do is a
+property of the ``ObservationSpec``, not of this class.  Under the default
+``own_frames`` spec a policy's ``opponent_history`` is built only from its
+own frames, so an extractor that sees just one player's decisions produces
+the same features as one that sees both — which is what makes this usable in
+the competition harness, where ``agent()`` is never called for the
+opponent's choices.  Under an ``opponent_frames`` spec the opponent's frames
+must be fed in, or their history comes back empty.  ``__call__`` derives the
+deciding player from ``obs["current"]["yourIndex"]``, so a shared instance is
+correct for both seats either way.
 """
 
 from typing import Any
 
-from features import (
-    decision_chain,
-    extract_features,
-    opponent_history,
-    split_observation,
-)
+from features import split_observation
+from observation import DEFAULT_SPEC, ObservationSpec, build_observation
 
 
 class LiveFeatureExtractor:
-    """Callable feature extractor with per-episode decision memory.
+    """Per-episode decision memory over live ``obs`` dicts.
+
+    This class owns exactly one thing the offline path does not: turning a
+    stream of engine observations into the row sequence the backward history
+    scans need, since a single ``obs`` carries no memory of earlier
+    decisions.  Assembling features from those rows is ``observation.py``'s
+    job, shared with ``dataset.py`` — so "what the policy sees" is defined
+    once rather than reimplemented per call site.
 
     ``record_action`` is optional: skip it and ``decision_chain`` entries
     carry ``target_action: None`` (the selection/options are still there).
@@ -49,12 +56,19 @@ class LiveFeatureExtractor:
 
     def __init__(
         self,
-        opponent_history_size: int = 60,
-        decision_chain_size: int = 60,
+        opponent_history_size: int | None = None,
+        decision_chain_size: int | None = None,
         player_names: tuple[str | None, str | None] = (None, None),
+        spec: ObservationSpec = DEFAULT_SPEC,
     ) -> None:
-        self.opponent_history_size = opponent_history_size
-        self.decision_chain_size = decision_chain_size
+        overrides = {}
+        if opponent_history_size is not None:
+            overrides["opponent_history_size"] = opponent_history_size
+        if decision_chain_size is not None:
+            overrides["decision_chain_size"] = decision_chain_size
+        # Pass the *same* spec used to build the training set. Defaults
+        # matching is not enough of a guarantee once specs start varying.
+        self.spec = spec.variant(**overrides) if overrides else spec
         self.player_names = player_names
         self._episode_id = -1
         self._rows: list[dict[str, Any]] = []
@@ -95,24 +109,7 @@ class LiveFeatureExtractor:
             "target_action": None,
         }
         self._rows.append(row)
-        idx = len(self._rows) - 1
-
-        features = extract_features(state, selection, options, player_index)
-        if self.opponent_history_size > 0:
-            features["opponent_history"] = opponent_history(
-                self._read_row, idx, row, self.opponent_history_size
-            )
-        if self.decision_chain_size > 0:
-            features["decision_chain"] = decision_chain(
-                self._read_row, idx, row, self.decision_chain_size
-            )
-        meta = {
-            "episode_id": row["episode_id"],
-            "frame_index": row["frame_index"],
-            "player_index": player_index,
-            "player_name": row["player_name"],
-        }
-        return {"features": features, "meta": meta}
+        return build_observation(self._read_row, len(self._rows) - 1, row, self.spec)
 
     def record_action(self, action: list[int]) -> None:
         """Attach the action chosen for the most recent observation, so it

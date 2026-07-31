@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset import PolicyFeatureDataset
 from live import LiveFeatureExtractor
+from observation import OWN_FRAMES
 
 
 def observation_from_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -88,11 +89,7 @@ def check_episode(dataset: PolicyFeatureDataset, start: int, stop: int) -> tuple
     """
     row = dataset._read_row(start)
     names = (row["player_name"], row["player_name"])
-    extractor = LiveFeatureExtractor(
-        opponent_history_size=dataset.opponent_history_size,
-        decision_chain_size=dataset.decision_chain_size,
-        player_names=names,
-    )
+    extractor = LiveFeatureExtractor(player_names=names, spec=dataset.spec)
     extractor.reset(episode_id=row["episode_id"])
 
     problems = []
@@ -113,6 +110,41 @@ def check_episode(dataset: PolicyFeatureDataset, start: int, stop: int) -> tuple
     return stop - start, problems
 
 
+def check_episode_one_sided(
+    dataset: PolicyFeatureDataset, start: int, stop: int, player_index: int
+) -> tuple[int, list[str]]:
+    """Feed the live extractor **only one player's** decisions and require the
+    features to still match offline.
+
+    This is the property the deployed agent depends on and the one the old
+    single-stream test could not express.  In the competition harness
+    ``agent()`` is called only for our own choices, so the opponent's frames
+    never reach the extractor at all.  Under the default ``own_frames`` spec
+    nothing in the observation is sourced from them, so dropping them must be
+    a no-op — and if some future spec change reintroduces a dependency on the
+    opponent's frames, this fails loudly instead of silently degrading the
+    served policy relative to the trained one.
+    """
+    row = dataset._read_row(start)
+    extractor = LiveFeatureExtractor(
+        player_names=(row["player_name"], row["player_name"]), spec=dataset.spec
+    )
+    extractor.reset(episode_id=row["episode_id"])
+
+    problems, checked = [], 0
+    for idx in range(start, stop):
+        row = dataset._read_row(idx)
+        if row["player_index"] != player_index:
+            continue  # the opponent's frame — invisible to a one-sided agent
+        offline, _ = dataset[idx]
+        live = extractor(observation_from_row(row))
+        extractor.record_action(row["target_action"])
+        checked += 1
+        problems += [f"row {idx} (one-sided, player {player_index}) features{d}"
+                     for d in differences(offline["features"], live["features"])]
+    return checked, problems
+
+
 def main() -> None:
     parquet_path = sys.argv[1] if len(sys.argv) > 1 else "data/policy_decisions.parquet"
     episodes = int(sys.argv[2]) if len(sys.argv) > 2 else 3
@@ -121,11 +153,10 @@ def main() -> None:
     # the episode, both players', to reproduce the same history a full-file
     # backward scan sees.  Sample indexes therefore equal raw row indexes here.
     dataset = PolicyFeatureDataset(parquet_path)
-    print(f"{parquet_path}: {len(dataset)} rows, "
-          f"opponent_history_size={dataset.opponent_history_size} "
-          f"decision_chain_size={dataset.decision_chain_size}")
+    print(f"{parquet_path}: {len(dataset)} rows, spec={dataset.spec}")
 
     total, all_problems = 0, []
+    one_sided_total = 0
     for start, stop in episode_bounds(dataset, episodes):
         episode_id = dataset._read_row(start)["episode_id"]
         checked, problems = check_episode(dataset, start, stop)
@@ -133,6 +164,18 @@ def main() -> None:
         all_problems += problems
         status = "OK" if not problems else f"{len(problems)} MISMATCHES"
         print(f"  episode {episode_id}: {checked} decisions -> {status}")
+
+        # Same episode, but each seat replayed in isolation — the shape the
+        # deployed agent actually runs in.
+        if dataset.spec.opponent_history_source == OWN_FRAMES:
+            for player_index in (0, 1):
+                seat_checked, seat_problems = check_episode_one_sided(
+                    dataset, start, stop, player_index
+                )
+                one_sided_total += seat_checked
+                all_problems += seat_problems
+                status = "OK" if not seat_problems else f"{len(seat_problems)} MISMATCHES"
+                print(f"    seat {player_index} alone: {seat_checked} decisions -> {status}")
 
     print()
     if all_problems:
@@ -144,6 +187,9 @@ def main() -> None:
         sys.exit(1)
 
     print(f"PASS: offline and live features are identical for all {total} decisions")
+    if one_sided_total:
+        print(f"  ...including {one_sided_total} replayed with only one seat's "
+              f"frames visible (the deployed agent's view)")
 
     # Non-empty coverage: identical-but-always-empty history groups would pass
     # the comparison above while proving nothing.
