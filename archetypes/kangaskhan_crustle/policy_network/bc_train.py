@@ -29,6 +29,7 @@ from policy_experimental import (
     DEFAULT_THRESHOLD,
     PolicyNetwork,
     decode_action,
+    equivalence_mask,
     masked_selection_loss,
     selection_counts,
 )
@@ -177,7 +178,8 @@ def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
                    wrong count.
     """
     policy.eval()
-    totals = {"loss": 0.0, "top1": 0.0, "exact": 0.0, "chance": 0.0, "count_mae": 0.0}
+    totals = {"loss": 0.0, "top1": 0.0, "top1eq": 0.0, "exact": 0.0,
+              "chance": 0.0, "count_mae": 0.0}
     num_samples = 0
     num_batches = 0
 
@@ -187,12 +189,20 @@ def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
 
         logits = policy(features)
+        equivalent = equivalence_mask(
+            features["decision_context"]["options"], targets, options_mask
+        )
         totals["loss"] += masked_selection_loss(logits, targets, options_mask).item()
         num_batches += 1
 
         # A masked-out position is -inf, so argmax can never land on one.
-        top1 = targets.gather(1, logits.argmax(dim=-1, keepdim=True)).squeeze(1)
+        prediction = logits.argmax(dim=-1, keepdim=True)
+        top1 = targets.gather(1, prediction).squeeze(1)
         totals["top1"] += top1.sum().item()
+        # Credit a prediction that is the *same play* as the expert's, not
+        # merely the same index — see equivalence_mask for why the index-exact
+        # number is capped around 63.7% regardless of policy quality.
+        totals["top1eq"] += equivalent.gather(1, prediction).squeeze(1).sum().item()
 
         num_valid = options_mask.sum(-1).clamp(min=1)
         num_target = targets.sum(-1)
@@ -212,6 +222,7 @@ def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
     return {
         "loss": totals["loss"] / max(num_batches, 1),
         "top1": totals["top1"] / num_samples,
+        "top1eq": totals["top1eq"] / num_samples,
         "exact": totals["exact"] / num_samples,
         "chance": totals["chance"] / num_samples,
         "count_mae": totals["count_mae"] / num_samples,
@@ -475,6 +486,7 @@ def train(
         print(
             f"epoch {epoch}   val: loss={metrics['loss']:.4f} "
             f"top1={metrics['top1']:.3f} (chance {metrics['chance']:.3f}) "
+            f"top1eq={metrics['top1eq']:.3f} "
             f"exact={metrics['exact']:.3f} count_mae={metrics['count_mae']:.2f}",
             flush=True,
         )

@@ -54,7 +54,73 @@ def _strip_player_index(node: Any) -> Any:
     return node
 
 
-def _remap_options(options: list[dict[str, Any]], player_index: int) -> list[dict[str, Any]]:
+#: ``cg.api.AreaType`` codes, mirrored here so this module stays free of the
+#: engine import (see ``vocab.AreaType`` for the full enum).
+_AREA_DECK, _AREA_HAND, _AREA_DISCARD = 1, 2, 3
+_AREA_ACTIVE, _AREA_BENCH = 4, 5
+_AREA_STADIUM, _AREA_LOOKING = 7, 12
+
+
+def resolve_option_card(
+    state: dict[str, Any], selection: dict[str, Any], option: dict[str, Any],
+    player_index: int,
+) -> int | None:
+    """The card id an option actually refers to, or ``None`` if unresolvable.
+
+    Options name their card **positionally**, not by id: ``cardId`` is
+    populated on 32 of 22,555 option slots in
+    ``data/policy_decisions_kangaskhan_crustle.parquet`` (only for ``SKILL``), while every
+    ``PLAY``/``ATTACH``/``CARD``/``EVOLVE`` says only "``HAND`` slot 5". So
+    without this join the model is choosing between options while blind to
+    *which card each one is* — "play hand slot 5" and "play hand slot 6" are
+    Boss's Orders and Hilda, but arrive as two indistinguishable options whose
+    only difference is a bare ``index / 10.0`` scalar. The hand is pooled by
+    then, so the correspondence is not recoverable downstream either.
+
+    96.6% of card-referring option slots resolve. The rest (a prize, an
+    out-of-range index mid-resolution) fall back to ``None``, which
+    ``vocab._card_id`` maps to the usual 0 "no card" sentinel.
+
+    Mirrors the lookup the rule-based agent does in its own
+    ``resolve_card_id`` — the same positional convention, kept in one place
+    here so the offline and live feature paths cannot disagree about it.
+    """
+    index = option.get("index")
+    if index is None:
+        return None
+    index = int(index)
+    if index < 0:
+        return None
+    area = option.get("area")
+    # PLAY leaves ``area`` unset; its index is into the player's own hand.
+    area = _AREA_HAND if area is None else int(area)
+    player = state["players"][player_index]
+    try:
+        if area == _AREA_HAND:
+            return int(player["hand"][index]["id"])
+        if area == _AREA_DISCARD:
+            return int(player["discard"][index]["id"])
+        if area == _AREA_ACTIVE:
+            return int(player["active"][index]["id"])
+        if area == _AREA_BENCH:
+            return int(player["bench"][index]["id"])
+        if area == _AREA_DECK:
+            return int(selection["deck"][index]["id"])
+        if area == _AREA_STADIUM:
+            return int(state["stadium"][index]["id"])
+        if area == _AREA_LOOKING:
+            return int(state["looking"][index]["id"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        # Facedown (every prize slot), an empty zone, or an index that points
+        # past a list mid-resolution — all genuinely "no known card".
+        return None
+    return None
+
+
+def _remap_options(
+    options: list[dict[str, Any]], player_index: int,
+    state: dict[str, Any] | None = None, selection: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Replace each option's absolute ``playerIndex`` with a POV-relative flag.
 
     An option can target either player's Pokémon (e.g. an attack target), so
@@ -64,10 +130,20 @@ def _remap_options(options: list[dict[str, Any]], player_index: int) -> list[dic
     Fields are also filled out to the full ``OPTION_FIELDS`` set so a live
     option (which omits inapplicable keys) and a replay-converted option
     (which stores them as ``None``) come out identical.
+
+    When ``state`` is given, an unset ``cardId`` is filled in from the
+    position the option points at — see ``resolve_option_card``.
     """
     remapped = []
     for option in options:
+        resolved = (
+            resolve_option_card(state, selection or {}, option, player_index)
+            if state is not None and option.get("cardId") is None
+            else None
+        )
         option = {field: option.get(field) for field in OPTION_FIELDS}
+        if option.get("cardId") is None and resolved is not None:
+            option["cardId"] = resolved
         raw = option.pop("playerIndex", None)
         option["targets_opponent"] = None if raw is None else raw != player_index
         remapped.append(option)
@@ -157,7 +233,8 @@ def diff_board_state(previous: dict[str, Any], current: dict[str, Any]) -> dict[
 
 
 def decision_context(
-    selection: dict[str, Any], options: list[dict[str, Any]], player_index: int
+    selection: dict[str, Any], options: list[dict[str, Any]], player_index: int,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """POV-normalised selection/options for whoever is making *this* decision.
 
@@ -169,7 +246,7 @@ def decision_context(
     """
     return {
         "selection": _strip_player_index(selection),
-        "options": _remap_options(options, player_index),
+        "options": _remap_options(options, player_index, state, selection),
     }
 
 
@@ -192,7 +269,7 @@ def extract_features(
         "state": board_state(state, player_index),
         "opponent_state": board_state(state, 1 - player_index),
         "global_state": _global_state(state),
-        "decision_context": decision_context(selection, options, player_index),
+        "decision_context": decision_context(selection, options, player_index, state),
     }
 
 
@@ -337,7 +414,9 @@ def decision_chain(
             chain.append({
                 "turn": prior["state"]["turn"],
                 "turn_action_count": prior["state"]["turnActionCount"],
-                **decision_context(prior["selection"], prior["options"], player_index),
+                **decision_context(
+                    prior["selection"], prior["options"], player_index, prior["state"]
+                ),
                 "target_action": prior["target_action"],
             })
         cursor -= 1

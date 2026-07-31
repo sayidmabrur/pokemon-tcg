@@ -45,7 +45,14 @@ from observation import DEFAULT_SPEC
 #: One concatenated file plus an offset index makes a random read exactly one
 #: ``pread`` of that sample's own bytes, and leaves caching to the OS page
 #: cache instead of a hand-rolled one that had a ~0% hit rate under shuffle.
-CACHE_FORMAT = "bin-v2"
+#:
+#: ``bin-v3`` is the same *layout* as v2 but different *values*: options now
+#: carry the card id they refer to (``features.resolve_option_card``), where
+#: before every option's ``card_id`` was the 0 sentinel. Keys and shapes are
+#: unchanged, so nothing downstream would raise on a v2 cache — it would just
+#: silently train on zeroed card identity. Hence the bump: this guard is the
+#: only thing that catches a values-only change.
+CACHE_FORMAT = "bin-v3"
 
 #: All sample blobs concatenated, addressed by ``manifest["offsets"]``.
 BLOB_FILENAME = "blobs.bin"

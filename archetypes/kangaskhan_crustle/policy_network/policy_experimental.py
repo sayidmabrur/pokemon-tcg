@@ -340,10 +340,23 @@ class DecisionContextEncoder(nn.Module):
     but this also exposes per-option vectors (for scoring against the
     pooled state to produce action logits), not just a pooled summary."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, nhead=2, layers=2):
         super().__init__()
         self.option = OptionEncoder(dim)
         self.selection = SelectionEncoder(dim)
+        # Self-attention *across the options of this decision*. Without it each
+        # option is encoded in isolation and scored as ``score(option_i,
+        # state)``, so option i never sees option j except through a mean-pooled
+        # summary — yet "is this the best play" is inherently comparative:
+        # whether Ultra Ball is right depends on what else is on the menu.
+        # Deliberately NO positional encoding here, unlike the two sequence
+        # encoders: options are a *set*, so permutation-equivariance is correct
+        # (the ordering of the list carries no meaning beyond the index
+        # pointer, which is already a feature).
+        encoder_layer = nn.TransformerEncoderLayer(
+            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True
+        )
+        self.option_attention = nn.TransformerEncoder(encoder_layer, layers)
 
     def forward(self, decision_context: dict):
         # ``options``/``selection`` carry a leading size-1 "chain position"
@@ -351,6 +364,9 @@ class DecisionContextEncoder(nn.Module):
         # dim 1 specifically, not dim 0 (that's the batch dim).
         option_vecs = self.option(decision_context["options"]).squeeze(1)  # (B, max_options, D)
         options_mask = decision_context["options"]["options_mask"].squeeze(1)  # (B, max_options)
+        option_vecs = self.option_attention(
+            option_vecs, src_key_padding_mask=_safe_key_padding_mask(options_mask)
+        )
         option_summary = _masked_mean(option_vecs, options_mask)
         selection_summary = self.selection(decision_context["selection"]).squeeze(1)  # (B, D)
         pooled = torch.cat([option_summary, selection_summary], dim=-1)
@@ -551,8 +567,52 @@ class OpponentHistoryEncoder(nn.Module):
 _MASK_LOGIT = -1e9
 
 
+#: Option fields that decide whether two options are the *same play*.
+#: Deliberately excludes ``index``/``serial``/``energy_index``: those are
+#: pointers into a pile of cards, so two options differing only there
+#: (hand slot 3 vs slot 5, both holding an Ultra Ball) do exactly the same
+#: thing. ``in_play_index`` is kept — it names *which* Pokémon is targeted,
+#: and two board Pokémon differ in HP and attached energy even when they
+#: share a card id. The ``card_*``/``attack_*`` flags are omitted as
+#: redundant: they are pure functions of ``card_id``/``attack_id_safe``.
+_EQUIVALENCE_FIELDS = (
+    "type", "area", "targets_opponent", "card_id",
+    "number", "count", "attack_id_safe", "in_play_index",
+)
+
+
+def equivalence_mask(
+    options: dict, targets: torch.Tensor, options_mask: torch.Tensor
+) -> torch.Tensor:
+    """``(B, N)`` bool marking every option that is the same play as the
+    expert's chosen option.
+
+    Measured on ``policy_decisions.parquet``, **50.5%** of single-select
+    decisions offer at least one option behaviourally identical to the one
+    the expert took, in tie groups 2-8 wide — and the expert resolves those
+    ties essentially arbitrarily (lowest index only 44.3% of the time). So
+    scoring a prediction against the one *index* the expert happened to click
+    charges the model for plays that are literally the same move, and caps
+    exact-index accuracy at ~63.7% no matter how good the policy is.
+
+    Only the first target is expanded, so this is meaningful for
+    single-select decisions; callers restrict its use accordingly.
+    """
+    feats = torch.stack(
+        [options[field].squeeze(1).float() for field in _EQUIVALENCE_FIELDS], dim=-1
+    )  # (B, N, F)
+    target_index = targets.argmax(dim=-1)
+    chosen = feats.gather(
+        1, target_index.view(-1, 1, 1).expand(-1, 1, feats.shape[-1])
+    )  # (B, 1, F)
+    return (feats == chosen).all(dim=-1) & options_mask
+
+
 def masked_selection_loss(
-    logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    mask: torch.Tensor,
+    equivalent: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Negative log-likelihood of the expert's selection, per decision.
 
@@ -578,6 +638,16 @@ def masked_selection_loss(
     without one silently dominating. Decisions selecting *nothing* (0.3%,
     declining an optional effect) fall here too, where an all-zero target is
     exactly right.
+
+    ``equivalent`` (from ``equivalence_mask``) makes the single-select term
+    indifferent between options that are the *same play*: instead of
+    maximising the probability of one arbitrary index, it maximises the total
+    probability of the whole tie group, ``-log sum_{i in group} p_i``. Since
+    the expert resolves those ties arbitrarily, the index-specific objective
+    was asking the model to fit coin flips — capacity spent on noise, and a
+    hard ceiling on the metric. This keeps the likelihood proper (the group
+    probabilities are a partition of the same softmax) while dropping the part
+    that was never learnable.
     """
     safe = logits.masked_fill(~mask, _MASK_LOGIT)
     num_positive = targets.sum(dim=-1)
@@ -585,9 +655,16 @@ def masked_selection_loss(
 
     per_decision = logits.new_zeros(logits.shape[0])
     if single.any():
-        per_decision[single] = F.cross_entropy(
-            safe[single], targets[single].argmax(dim=-1), reduction="none"
-        )
+        if equivalent is None:
+            per_decision[single] = F.cross_entropy(
+                safe[single], targets[single].argmax(dim=-1), reduction="none"
+            )
+        else:
+            log_probs = F.log_softmax(safe[single], dim=-1)
+            group = equivalent[single]
+            per_decision[single] = -torch.logsumexp(
+                log_probs.masked_fill(~group, _MASK_LOGIT), dim=-1
+            )
     multi = ~single
     if multi.any():
         per_option = F.binary_cross_entropy_with_logits(
