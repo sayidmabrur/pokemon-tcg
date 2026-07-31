@@ -12,21 +12,51 @@ padding/masking is built.
 
 import argparse
 import json
+import math
 import random
+import sys
 import time
 from pathlib import Path
 
 import torch
+import torch.multiprocessing
 import torch.utils.data
 
 from collate import collate_features, pad_stack
 from dataset import PolicyFeatureDataset, transform
+from precomputed_dataset import PrecomputedPolicyFeatureDataset
 from policy_experimental import (
+    DEFAULT_THRESHOLD,
     PolicyNetwork,
     decode_action,
-    masked_bce_loss,
+    masked_selection_loss,
     selection_counts,
 )
+
+# duel_inference.py lives in archetypes/alakazam/ (one level up from this
+# file's policy_network/ directory) — needed for the end-of-epoch match
+# against PolicyRuleBased, which is a much better read on playing strength
+# than the loss/exact-match numbers above (see run_epoch_duel).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import duel_inference
+
+# Batches reach the main process as ~520 separate tensors, and torch's default
+# "file_descriptor" sharing strategy passes each one as an SCM_RIGHTS file
+# descriptor over a socket. That handshake fails outright — "RuntimeError:
+# received 0 items of ancdata" from ``recvfds`` — when a worker dies mid-send,
+# which on a memory-tight box happens at worker-fork time, before the first
+# batch is ever produced. It is intermittent for exactly that reason: it
+# depends on how much RAM is free at the instant the workers fork.
+#
+# "file_system" passes tensors through named shared-memory files instead, so
+# there is no fd handshake left to fail. That strategy is safe *here* because
+# the number of simultaneously-live shared objects is bounded — ~520 tensors
+# per batch times the handful of batches in flight, each freed as its batch is
+# consumed. It was NOT safe in precompute_features.py, where the main process
+# accumulated thousands of samples' worth of worker-backed tensors at once and
+# blew past vm.max_map_count (see that module's CACHE_FORMAT note). Bounded
+# versus unbounded is the whole difference between the two cases.
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 def collate_batch(batch: list[tuple[dict, torch.Tensor]]):
@@ -126,12 +156,10 @@ def calibrate_threshold(
 def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
     """Policy-quality metrics on a held-out split.
 
-    The BCE number the training loop prints is *not* a measure of how well
-    the policy plays. It is a per-option average over a target that is
-    ~1 selected option among N, so it is dominated by the easy negatives:
-    a model that answers "no" to every option already scores well on it,
-    and the loss keeps dropping long after the argmax has stopped
-    improving. These are the numbers that actually track playing strength:
+    The loss the training loop prints is *not* a measure of how well the
+    policy plays: it is an average negative log-likelihood, and it keeps
+    dropping long after the argmax has stopped improving. These are the
+    numbers that actually track playing strength:
 
     ``top1``       the single highest-scoring option is one the expert
                    really did pick — the closest thing to "would it make
@@ -159,7 +187,7 @@ def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
 
         logits = policy(features)
-        totals["loss"] += masked_bce_loss(logits, targets, options_mask).item()
+        totals["loss"] += masked_selection_loss(logits, targets, options_mask).item()
         num_batches += 1
 
         # A masked-out position is -inf, so argmax can never land on one.
@@ -190,13 +218,77 @@ def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
     }
 
 
+class _InProcessBCPolicy:
+    """Same ``.act(obs)``/``.reset(episode_id)`` interface as
+    ``duel_inference.BCPolicy``, but wraps the network still being trained
+    directly rather than round-tripping it through a checkpoint file — so
+    the end-of-epoch duel measures the exact in-memory weights just
+    trained, not a stale save from a previous epoch."""
+
+    def __init__(self, network: PolicyNetwork, threshold: float, device: str):
+        self.network = network
+        self.threshold = threshold
+        self.device = device
+        self.extractor = duel_inference.LiveFeatureExtractor()
+        self.decisions = 0
+        self.empty_selections = 0
+
+    def reset(self, episode_id: int) -> None:
+        self.extractor.reset(episode_id=episode_id)
+
+    def act(self, obs: dict) -> list[int]:
+        observation = self.extractor(obs)
+        features = _to_device(collate_features([transform(observation)]), self.device)
+        with torch.no_grad():
+            logits = self.network(features)
+        min_count, max_count = selection_counts(features)
+        options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
+        action = decode_action(
+            logits, options_mask, min_count, max_count, threshold=self.threshold
+        )[0]
+        self.extractor.record_action(action)
+        self.decisions += 1
+        if not action:
+            self.empty_selections += 1
+        return action
+
+
+def run_epoch_duel(
+    policy: PolicyNetwork,
+    device: str,
+    deck: list[int],
+    opponent_deck: list[int],
+    episodes: int,
+    seats: str,
+) -> dict[str, float]:
+    """Play ``episodes`` games of the current weights against
+    ``PolicyRuleBased`` — the number that actually matters (win rate),
+    versus the proxy metrics ``evaluate()`` reports against the offline
+    expert labels. Slower than ``evaluate()`` since it runs the real game
+    engine turn-by-turn, so keep ``episodes`` modest for a per-epoch check."""
+    policy.eval()
+    challenger = _InProcessBCPolicy(policy, DEFAULT_THRESHOLD, device)
+    seat_list = [0, 1] if seats == "both" else [int(seats)]
+    per_seat = max(1, episodes // len(seat_list))
+    wins, total = 0, 0
+    for seat in seat_list:
+        outcome = duel_inference.duel(challenger, deck, opponent_deck, per_seat, seat, quiet=True)
+        wins += outcome["wins"]
+        total += outcome["episodes"]
+    policy.train()
+    rate = wins / max(total, 1)
+    empty_rate = challenger.empty_selections / max(challenger.decisions, 1)
+    return {"wins": wins, "episodes": total, "rate": rate, "empty_rate": empty_rate}
+
+
 def train(
     parquet_path: str = "data/policy_decisions.parquet",
     player_name: str = "Yushin Ito",
     epochs: int = 1,
     lr: float = 1e-3,
+    grad_clip: float = 1.0,
     batch_size: int = 64,
-    log_every: int = 10,
+    log_every: int = 0,
     limit: int | None = None,
     device: str | None = None,
     num_workers: int = 4,
@@ -205,16 +297,49 @@ def train(
     val_frac: float = 0.1,
     seed: int = 0,
     out: str | None = None,
+    duel_episodes: int = 20,
+    duel_seats: str = "both",
+    duel_deck: str | None = None,
+    duel_opponent_deck: str | None = None,
+    precomputed_dir: str | None = None,
+    cached_shards: int = 4,
 ) -> PolicyNetwork:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}, batch_size={batch_size}", flush=True)
 
+    duel_deck_ids, duel_opponent_deck_ids = None, None
+    if duel_episodes > 0:
+        duel_deck_path = Path(duel_deck or duel_inference._REPO_ROOT / "alakazam_deck.csv")
+        duel_opponent_deck_path = Path(
+            duel_opponent_deck or duel_inference._REPO_ROOT / "crustle-agent-rule-based/deck.csv"
+        )
+        duel_deck_ids = duel_inference.read_deck(duel_deck_path)
+        duel_opponent_deck_ids = duel_inference.read_deck(duel_opponent_deck_path)
+        print(
+            f"end-of-epoch duel: {duel_episodes} episodes/epoch vs PolicyRuleBased "
+            f"({duel_deck_path.name} vs {duel_opponent_deck_path.name})",
+            flush=True,
+        )
+
     t0 = time.time()
-    dataset = PolicyFeatureDataset(
-        parquet_path, player_name=player_name, transform=transform,
-        cached_row_groups=cached_row_groups,
-    )
-    print(f"dataset ready in {time.time() - t0:.1f}s — {len(dataset)} samples", flush=True)
+    if precomputed_dir is not None:
+        # Skips build_observation()/transform() entirely — see
+        # precompute_features.py's docstring. Every epoch after the first
+        # is where this actually pays off, since PolicyFeatureDataset would
+        # otherwise redo that per-sample work from scratch each time.
+        dataset = PrecomputedPolicyFeatureDataset(precomputed_dir, cached_shards=cached_shards)
+        print(
+            f"loaded precomputed dataset from {precomputed_dir} in "
+            f"{time.time() - t0:.1f}s — {len(dataset)} samples "
+            f"(player_name={dataset.manifest['player_name']!r})",
+            flush=True,
+        )
+    else:
+        dataset = PolicyFeatureDataset(
+            parquet_path, player_name=player_name, transform=transform,
+            cached_row_groups=cached_row_groups,
+        )
+        print(f"dataset ready in {time.time() - t0:.1f}s — {len(dataset)} samples", flush=True)
 
     train_idx, val_idx = episode_split(dataset, val_frac, seed)
     if limit is not None:
@@ -256,11 +381,32 @@ def train(
 
     policy = PolicyNetwork().to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    # Linear warmup then cosine decay. The two sequence encoders are 8-layer
+    # transformers; even pre-LN, a deep stack starting at full LR takes large
+    # early steps on attention weights that are still random, which is what
+    # makes results vary run to run rather than converge. Warmup is the
+    # standard fix and costs a few hundred batches.
+    total_steps = max(1, epochs * len(loader))
+    warmup_steps = min(max(1, int(0.03 * total_steps)), 500)
+
+    def lr_at(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_at)
+    print(
+        f"schedule: {total_steps} steps, {warmup_steps} warmup, cosine decay, "
+        f"grad clip {grad_clip}",
+        flush=True,
+    )
     best_exact = -1.0
     best_epoch = -1
 
     for epoch in range(epochs):
         total_loss = 0.0
+        total_grad_norm = 0.0
         num_batches = 0
         t_epoch = time.time()
         for i, (features, targets) in enumerate(loader):
@@ -269,25 +415,55 @@ def train(
             options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
 
             logits = policy(features)
-            loss = masked_bce_loss(logits, targets, options_mask)
+            loss = masked_selection_loss(logits, targets, options_mask)
 
             optimizer.zero_grad()
             loss.backward()
+            # Clip before stepping: a single outlier batch (a 44-option
+            # decision, an unusually long chain) can otherwise land one huge
+            # update that the rest of the epoch spends recovering from.
+            grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
+            total_grad_norm += float(grad_norm)
             num_batches += 1
-            if (i + 1) % log_every == 0:
+            # log_every=0 (the default) reports once per epoch instead of
+            # mid-epoch. The per-epoch line below carries the same numbers
+            # aggregated, so nothing is lost by leaving this off.
+            if log_every and (i + 1) % log_every == 0:
                 elapsed = time.time() - t_epoch
                 print(
                     f"epoch {epoch} batch {i + 1}/{len(loader)}: "
                     f"avg loss={total_loss / num_batches:.4f}, "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e} "
+                    f"|g|={float(grad_norm):.2f}, "
                     f"{elapsed / num_batches:.2f}s/batch",
                     flush=True,
                 )
 
         train_loss = total_loss / max(num_batches, 1)
-        print(f"epoch {epoch} done: train loss={train_loss:.4f}", flush=True)
+        epoch_seconds = time.time() - t_epoch
+        print(
+            f"epoch {epoch} done: train loss={train_loss:.4f} "
+            f"lr={optimizer.param_groups[0]['lr']:.2e} "
+            f"|g|avg={total_grad_norm / max(num_batches, 1):.2f} "
+            f"({num_batches} batches, {epoch_seconds:.0f}s, "
+            f"{epoch_seconds / max(num_batches, 1):.2f}s/batch)",
+            flush=True,
+        )
+
+        if duel_episodes > 0:
+            duel_result = run_epoch_duel(
+                policy, device, duel_deck_ids, duel_opponent_deck_ids, duel_episodes, duel_seats,
+            )
+            print(
+                f"epoch {epoch}   duel vs PolicyRuleBased: "
+                f"{duel_result['wins']}/{duel_result['episodes']} = {duel_result['rate']:.1%} "
+                f"(declined {duel_result['empty_rate']:.1%})",
+                flush=True,
+            )
 
         if val_loader is None:
             continue
@@ -354,6 +530,11 @@ if __name__ == "__main__":
     parser.add_argument("--player-name", default="Yushin Ito")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--grad-clip", type=float, default=1.0,
+        help="max global grad norm; the 8-layer sequence encoders are the "
+             "reason this matters (see the schedule set up in train())",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--limit", type=int, default=None, help="cap dataset size (debug)")
     parser.add_argument("--out", default="bc_policy.pt")
@@ -365,7 +546,12 @@ if __name__ == "__main__":
              "0 runs preprocessing single-threaded on the main process, leaving "
              "the GPU idle between batches",
     )
-    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--log-every", type=int, default=0,
+        help="print a progress line every N batches; 0 (the default) prints "
+             "only the per-epoch summary, which already reports the same "
+             "loss/lr/grad-norm/timing aggregated over the epoch",
+    )
     parser.add_argument(
         "--val-frac", type=float, default=0.1,
         help="fraction of *episodes* (not rows) held out for validation; 0 disables it",
@@ -373,6 +559,38 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="controls the episode split")
     parser.add_argument("--no-shuffle", action="store_true", help="disable shuffling (debug)")
     parser.add_argument("--cached-row-groups", type=int, default=16)
+    parser.add_argument(
+        "--duel-episodes", type=int, default=20,
+        help="games vs PolicyRuleBased to play at the end of every epoch (0 disables); "
+             "this is the actual win-rate signal, slower than --val-frac's offline metrics "
+             "since it runs the real engine turn-by-turn",
+    )
+    parser.add_argument(
+        "--duel-seats", default="both", choices=("0", "1", "both"),
+        help="which seat the policy plays in the end-of-epoch duel; 'both' splits "
+             "--duel-episodes across both",
+    )
+    parser.add_argument(
+        "--duel-deck", default=None,
+        help="deck for the policy in the end-of-epoch duel; defaults to alakazam_deck.csv",
+    )
+    parser.add_argument(
+        "--duel-opponent-deck", default=None,
+        help="deck for PolicyRuleBased in the end-of-epoch duel; defaults to "
+             "crustle-agent-rule-based/deck.csv",
+    )
+    parser.add_argument(
+        "--precomputed-dir", default=None,
+        help="load samples from a precompute_features.py cache instead of "
+             "reading --parquet live; skips build_observation()/transform() on "
+             "every epoch, which is the actual training bottleneck (see "
+             "precompute_features.py). --player-name/--parquet are ignored "
+             "when this is set, since the cache already fixes both.",
+    )
+    parser.add_argument(
+        "--cached-shards", type=int, default=4,
+        help="LRU shard cache size for --precomputed-dir (ignored otherwise)",
+    )
     parser.add_argument(
         "--calibrate-only", default=None, metavar="CHECKPOINT",
         help="skip training: calibrate an existing checkpoint's decode threshold "
@@ -406,8 +624,12 @@ if __name__ == "__main__":
     # checkpoint worth keeping is the best epoch, which only the loop knows.
     train(
         args.parquet, args.player_name, args.epochs, args.lr,
+        grad_clip=args.grad_clip,
         batch_size=args.batch_size, log_every=args.log_every, limit=args.limit,
         device=args.device, num_workers=args.num_workers, shuffle=not args.no_shuffle,
         cached_row_groups=args.cached_row_groups,
         val_frac=args.val_frac, seed=args.seed, out=args.out,
+        duel_episodes=args.duel_episodes, duel_seats=args.duel_seats,
+        duel_deck=args.duel_deck, duel_opponent_deck=args.duel_opponent_deck,
+        precomputed_dir=args.precomputed_dir, cached_shards=args.cached_shards,
     )

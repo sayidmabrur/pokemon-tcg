@@ -13,14 +13,16 @@ checks it decision-by-decision), so nothing is lost — but wiring it this way
 means the number printed here is a measurement of the thing that actually
 gets submitted, not of a better-informed variant of it.
 
-Both seats play the same deck, so the win rate isolates policy strength from
-deck strength. It defaults to ``alakazam_deck.csv``, the list reconstructed
-from the replays the policy was cloned from; playing anything else hands the
-network cards it never saw its expert play, which measures the mismatch
-rather than the policy.
+The BC policy defaults to ``alakazam_deck.csv``, the list reconstructed from
+the replays it was cloned from; playing anything else hands the network
+cards it never saw its expert play, which measures the mismatch rather than
+the policy. ``PolicyRuleBased`` defaults to
+``crustle-agent-rule-based/deck.csv``, since its heuristics are written for
+that specific decklist and play badly with any other.
 """
 
 import argparse
+import importlib.util
 import random
 import sys
 from pathlib import Path
@@ -28,19 +30,46 @@ from pathlib import Path
 import torch
 
 # This file lives in archetypes/alakazam/ (not the repo root), so the repo
-# root isn't on sys.path by default — needed for ``main``/``cg.game``/
-# ``crustle_rule_based_agent``.
+# root isn't on sys.path by default — needed for ``main``/``cg.game``.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).parent / "policy_network"))
 
 from cg.game import battle_finish, battle_select, battle_start
-from crustle_rule_based_agent import PolicyRuleBased
 
 from collate import collate_features
 from dataset import transform
 from live import LiveFeatureExtractor
 from policy_experimental import decode_action, load_policy, selection_counts
+
+
+def _load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# crustle-agent-rule-based/main.py shares the module name "main" with
+# _REPO_ROOT/main.py, so it is loaded under a distinct module name rather
+# than a plain ``import main`` to avoid clobbering sys.modules["main"].
+_crustle_agent_dir = _REPO_ROOT / "crustle-agent-rule-based"
+sys.path.insert(0, str(_crustle_agent_dir))
+_crustle_agent_main = _load_module(
+    "crustle_agent_rule_based_main", _crustle_agent_dir / "main.py"
+)
+
+
+class PolicyRuleBased:
+    """Adapts crustle-agent-rule-based/main.py's plain rule_based_select/
+    validate functions to the .act(obs) -> list[int] interface ``duel``
+    expects (that module has no PolicyRuleBased class of its own)."""
+
+    def act(self, obs: dict) -> list[int]:
+        ctx_obs = _crustle_agent_main.to_observation_class(obs)
+        choice = _crustle_agent_main.rule_based_select(ctx_obs)
+        return _crustle_agent_main.validate(ctx_obs.select, choice)
 
 
 def read_deck(path: Path) -> list[int]:
@@ -179,14 +208,13 @@ def duel(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--deck", default=str(_REPO_ROOT / "alakazam_deck.csv"))
     parser.add_argument(
-        "--opponent-deck", default=None,
-        help="deck for PolicyRuleBased; defaults to --deck (mirror match, which "
-             "isolates policy strength but hands the rule-based agent a deck its "
-             "hardcoded heuristics were not written for). Pass deck.csv to let it "
-             "pilot its own list — the fairer opponent, though deck strength then "
-             "contributes to the result too. Worth running both.",
+        "--deck", default=str(_REPO_ROOT / "alakazam_deck.csv"),
+        help="deck for the BC policy",
+    )
+    parser.add_argument(
+        "--opponent-deck", default=str(_REPO_ROOT / "crustle-agent-rule-based/deck.csv"),
+        help="deck for PolicyRuleBased",
     )
     parser.add_argument("--checkpoint", default=str(_REPO_ROOT / "checkpoints/bc_policy.pt"))
     parser.add_argument(
@@ -202,10 +230,9 @@ def main() -> None:
     args = parser.parse_args()
 
     deck = read_deck(Path(args.deck))
-    opponent_deck = read_deck(Path(args.opponent_deck)) if args.opponent_deck else deck
+    opponent_deck = read_deck(Path(args.opponent_deck))
     print(f"deck:          {args.deck} ({len(set(deck))} distinct cards)")
-    print(f"opponent deck: {args.opponent_deck or args.deck} "
-          f"({len(set(opponent_deck))} distinct cards)")
+    print(f"opponent deck: {args.opponent_deck} ({len(set(opponent_deck))} distinct cards)")
 
     seats = [0, 1] if args.seats == "both" else [int(args.seats)]
     per_seat = max(1, args.episodes // len(seats))
