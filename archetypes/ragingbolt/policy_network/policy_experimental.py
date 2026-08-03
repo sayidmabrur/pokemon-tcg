@@ -691,47 +691,32 @@ def masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Ten
 
 
 #: Probability above which an option is selected, for the decisions where the
-#: count is genuinely free (optional and multi-select — see ``decode_action``;
-#: single-select is an argmax and ignores this). NOT 0.5 — that value only
-#: makes sense for a balanced binary decision, and this is not one. The
-#: training target is ~1 selected option out of N, so a well-fit model
-#: spreads its probability mass across the candidates: on decisions where the
-#: expert really did take a card, the *highest* scoring option has a median
-#: probability of ~0.57, and 44% of such decisions have no option above 0.5
-#: at all. Decoding those at 0.5 returns an empty selection, which is legal
-#: whenever ``minCount == 0`` and therefore fails silently — the card gets
-#: played and its effect is declined. Measured against the expert, who
-#: declines optional selections only 2.1% of the time, that is nearly always
-#: the wrong call.
+#: count is genuinely free — optional (``minCount == 0``) and multi-select
+#: (``maxCount > 1``), together ~17% of decisions. The other ~83% are
+#: single-select, where the bracket forces one pick and this is ignored
+#: entirely: that case is a plain argmax over the categorical distribution
+#: ``masked_selection_loss`` fits with softmax cross-entropy.
 #:
-#: This default is the value calibrated on held-out data (see
-#: ``bc_train.calibrate_threshold``); a checkpoint's own calibrated value
-#: travels beside it in ``<checkpoint>.meta.json`` and takes precedence, since
-#: the right threshold depends on how well that particular model is fit.
+#: A fixed default is enough now. It was not under the old ``masked_bce_loss``,
+#: which scored a 1-of-N choice as N independent Bernoullis and so compressed
+#: every probability toward zero — that left the useful cut on a knife edge
+#: (0.5 declined 44% of optional effects outright) and needed a per-checkpoint
+#: sweep to place. Cross-entropy removed the compression, and the model's
+#: probabilities are now well enough separated that this value does not matter:
+#: measured over 210 live decisions, every threshold from 0.02 to 0.15 decodes
+#: *identically*, and only at 0.30+ does anything change at all. Calibrating a
+#: parameter that provably changes nothing is worse than a constant — it
+#: implies a precision that isn't there, and a stale calibration file then
+#: reads as a live misconfiguration.
 DEFAULT_THRESHOLD = 0.15
 
 
-def load_policy(checkpoint, map_location="cpu") -> tuple["PolicyNetwork", float]:
-    """Load weights plus the decode threshold calibrated for them.
-
-    Threshold and weights are a matched pair — serving a checkpoint under a
-    threshold calibrated for a different one reintroduces exactly the
-    silent-decline bug this pairing exists to prevent — so they are loaded
-    together rather than left to each call site to remember.
-    """
-    import json
-    from pathlib import Path
-
-    checkpoint = Path(checkpoint)
+def load_policy(checkpoint, map_location="cpu") -> "PolicyNetwork":
+    """Load a checkpoint's weights, ready for inference."""
     network = PolicyNetwork()
     network.load_state_dict(torch.load(checkpoint, map_location=map_location))
     network.eval()
-
-    threshold = DEFAULT_THRESHOLD
-    meta_path = checkpoint.with_suffix(checkpoint.suffix + ".meta.json")
-    if meta_path.is_file():
-        threshold = float(json.loads(meta_path.read_text())["threshold"])
-    return network, threshold
+    return network
 
 
 def decode_action(

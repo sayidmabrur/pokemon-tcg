@@ -11,10 +11,12 @@ from torch.utils.data import Dataset
 
 from observation import DEFAULT_SPEC, ObservationSpec, build_observation
 from vocab import (
+    HP_CAP,
     EnergyType,
     OptionsVocab,
     SelectionVocab,
     _card_id,
+    attack_flags,
     card_type_flags,
     pad_options,
     stack_selections,
@@ -562,8 +564,11 @@ _NORMALIZATION_CAPS = {
     "deck_count": 60.0,  # exact deck size cap (fixed TCG rule)
     "hand_count": 60.0,  # observed max 31; deck-size scale as the bound
     "prize_count": 6.0,  # fixed rule: matches start with 6 prize cards
-    "hp": 400.0,  # CardData.hp observed max 380 across all_card_data()
-    "max_hp": 400.0,
+    # Board HP shares ``vocab.HP_CAP`` with a card's printed HP and with attack
+    # damage, so all three are directly comparable in normalized space — see
+    # ``HP_CAP``'s own comment for why that matters.
+    "hp": HP_CAP,
+    "max_hp": HP_CAP,
     # hp_lost sums drops across every Pokémon that took damage in one
     # opponent turn (spread attacks can hit several), so it isn't bounded by
     # a single card's max HP the way "hp"/"max_hp" are — generous headroom
@@ -602,8 +607,21 @@ def _with_normalized_selection(fields: dict) -> dict:
     return fields
 
 
+def _with_attack_flags(fields: dict) -> dict:
+    """Join options' ``attack_id`` against the static ``Attack`` lookup, the
+    attack-side counterpart to ``_with_card_flags``. An ATTACK option's whole
+    point is what the attack *does* — 200 damage for {C}{C}{C} — and none of
+    that was previously in the input; only the raw id was, scaled as if it
+    were a magnitude. Non-attack options resolve to the all-zero "no attack"
+    row (see ``vocab.attack_flags``)."""
+    fields.update(attack_flags(fields["attack_id"]))
+    return fields
+
+
 def _options_with_card_flags(options):
-    return _with_normalized_options(_with_card_flags(pad_options(options), "card_id", "card"))
+    return _with_attack_flags(
+        _with_normalized_options(_with_card_flags(pad_options(options), "card_id", "card"))
+    )
 
 
 def _selections_with_card_flags(selections):

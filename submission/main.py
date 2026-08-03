@@ -93,7 +93,6 @@ class _Policy:
 
     def __init__(self) -> None:
         self.network = None
-        self.threshold = None
         self.extractor = None
         self.episode = 0
         self.failed = False
@@ -109,12 +108,7 @@ class _Policy:
         from live import LiveFeatureExtractor
         from policy_experimental import load_policy
 
-        # load_policy also reads the decode threshold calibrated for these
-        # weights. It is not a cosmetic setting: left at the naive 0.5 the
-        # policy declines ~44% of optional effects outright (it plays the
-        # card and takes nothing), because with one target option among N the
-        # per-option probabilities are all well under 0.5 by construction.
-        self.network, self.threshold = load_policy(_resolve("bc_policy.pt"))
+        self.network = load_policy(_resolve("bc_policy.pt"))
         if self.extractor is None:
             self.extractor = LiveFeatureExtractor()
             self.extractor.reset(episode_id=self.episode)
@@ -136,9 +130,7 @@ class _Policy:
 
         min_count, max_count = selection_counts(features)
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        action = decode_action(
-            logits, options_mask, min_count, max_count, threshold=self.threshold
-        )[0]
+        action = decode_action(logits, options_mask, min_count, max_count)[0]
         # The chain the *next* decision reads back only lines up if the move
         # actually submitted is the one recorded.
         self.extractor.record_action(action)

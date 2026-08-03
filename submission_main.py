@@ -48,10 +48,18 @@ except NameError:
 # short-circuiting on that would skip the policy directory too — which is
 # not implied by it, since the policy modules import each other by bare name
 # rather than as a package.
+#
+# The archetype directory is discovered by glob rather than named: this same
+# file is bundled for every archetype (alakazam, crustle, ...), and each one
+# copies its own ``archetypes/<name>/policy_network`` into the bundle. A
+# hardcoded name would put a non-existent directory on sys.path and the
+# bare-name imports below would fail at load time for every archetype but
+# one. Exactly one such directory exists per bundle, so the glob is
+# unambiguous.
 for _candidate in (_ROOT, Path("/kaggle_simulations/agent")):
     if not _candidate.is_dir():
         continue
-    for _entry in (_candidate, _candidate / "archetypes/alakazam/policy_network"):
+    for _entry in (_candidate, *sorted(_candidate.glob("archetypes/*/policy_network"))):
         if _entry.is_dir() and str(_entry) not in sys.path:
             sys.path.insert(0, str(_entry))
 
@@ -74,7 +82,7 @@ def read_deck_csv() -> list[int]:
     """Read the bundled decklist — 60 bare card ids, one per line.
 
     This is the deck reconstructed from the replays of the player the policy
-    was cloned from (see ``archetypes/alakazam/build_alakazam_deck.py``).
+    was cloned from (see the bundled archetype's ``build_*_deck.py``).
     Piloting any other deck would hand the network cards it never saw that
     player play, which is exactly the mismatch this bundle exists to avoid.
     """
@@ -93,7 +101,6 @@ class _Policy:
 
     def __init__(self) -> None:
         self.network = None
-        self.threshold = None
         self.extractor = None
         self.episode = 0
         self.failed = False
@@ -109,12 +116,7 @@ class _Policy:
         from live import LiveFeatureExtractor
         from policy_experimental import load_policy
 
-        # load_policy also reads the decode threshold calibrated for these
-        # weights. It is not a cosmetic setting: left at the naive 0.5 the
-        # policy declines ~44% of optional effects outright (it plays the
-        # card and takes nothing), because with one target option among N the
-        # per-option probabilities are all well under 0.5 by construction.
-        self.network, self.threshold = load_policy(_resolve("bc_policy.pt"))
+        self.network = load_policy(_resolve("bc_policy.pt"))
         if self.extractor is None:
             self.extractor = LiveFeatureExtractor()
             self.extractor.reset(episode_id=self.episode)
@@ -136,9 +138,7 @@ class _Policy:
 
         min_count, max_count = selection_counts(features)
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        action = decode_action(
-            logits, options_mask, min_count, max_count, threshold=self.threshold
-        )[0]
+        action = decode_action(logits, options_mask, min_count, max_count)[0]
         # The chain the *next* decision reads back only lines up if the move
         # actually submitted is the one recorded.
         self.extractor.record_action(action)

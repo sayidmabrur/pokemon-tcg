@@ -8,3 +8,4 @@ env/
 .env/
 replays/
 precomputed_features_*
+precomputed_features_*/

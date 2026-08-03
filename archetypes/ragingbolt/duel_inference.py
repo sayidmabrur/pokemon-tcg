@@ -94,9 +94,8 @@ class BCPolicy:
                 f"no checkpoint at {checkpoint} — train one with "
                 f"policy_network/bc_train.py, or pass --checkpoint"
             )
-        # Weights and threshold load together — see load_policy.
-        self.network, self.threshold = load_policy(checkpoint)
-        print(f"[BCPolicy] loaded {checkpoint} (decode threshold {self.threshold:.2f})")
+        self.network = load_policy(checkpoint)
+        print(f"[BCPolicy] loaded {checkpoint}")
         self.extractor = LiveFeatureExtractor()
         self.decisions = 0
         self.empty_selections = 0
@@ -111,9 +110,7 @@ class BCPolicy:
             logits = self.network(features)
         min_count, max_count = selection_counts(features)
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        action = decode_action(
-            logits, options_mask, min_count, max_count, threshold=self.threshold
-        )[0]
+        action = decode_action(logits, options_mask, min_count, max_count)[0]
         self.extractor.record_action(action)
         self.decisions += 1
         # An empty selection is legal only when minCount is 0, and it means
@@ -264,8 +261,8 @@ def main() -> None:
         print(
             f"declined effects: {bc.empty_selections}/{bc.decisions} decisions "
             f"({rate:.1%}) selected nothing — the expert declines ~2% of "
-            f"optional selections, so a rate far above that means the decode "
-            f"threshold is too high (see bc_train.calibrate_threshold)"
+            f"optional selections, so a rate far above that means the policy "
+            f"is skipping effects it should be using"
         )
     for name, totals in results.items():
         low, high = wilson(totals["wins"], totals["episodes"])

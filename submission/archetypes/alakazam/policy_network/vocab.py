@@ -197,6 +197,30 @@ CARD_STAGE_VOCAB_SIZE = len(CardStage)
 CARD_TYPE_VOCAB_SIZE = len(CardType) + 1
 CARD_ENERGY_TYPE_VOCAB_SIZE = len(EnergyType) + 1
 
+#: ``weakness``/``resistance`` are ``Optional[EnergyType]`` (246 of 1267 cards
+#: have no weakness, 1047 no resistance — every Trainer/Energy plus some
+#: Pokémon), so they take the same +1 shift: 0 = "none", real types at 1..12.
+CARD_WEAKNESS_VOCAB_SIZE = len(EnergyType) + 1
+CARD_RESISTANCE_VOCAB_SIZE = len(EnergyType) + 1
+
+#: One shared scale for every HP-like and damage-like magnitude in the
+#: codebase — board HP, a card's printed HP, and an attack's damage all
+#: divide by this. Sharing it is the point, not an accident: normalized
+#: attack damage and normalized defender HP then live on the *same* axis, so
+#: "does this attack KO that Pokémon" is the directly comparable
+#: ``damage_norm >= hp_norm`` rather than a relationship the model has to
+#: reconstruct across two differently-scaled inputs. Observed maxima:
+#: ``CardData.hp`` 380, ``Attack.damage`` 350 (both from the engine's own
+#: database), so 400 clears both with headroom.
+HP_CAP = 400.0
+#: ``CardData.retreatCost`` is 0-4 across all 1267 cards; 5 leaves room for a
+#: costlier printing without rescaling.
+RETREAT_COST_CAP = 5.0
+#: ``len(Attack.energies)`` is 0-5, and the most copies of one energy type in
+#: a single cost is also 5 — so this caps both the total cost and each
+#: per-type count.
+ENERGY_COST_CAP = 6.0
+
 #: Per-``card_id`` static lookup tables (``cg.api.CardData``'s ``cardType``/
 #: ``energyType``/``ex``/``megaEx``/``tera``/``aceSpec``/stage flags), built
 #: once from ``all_card_data()`` so a board Pokémon's ``id`` can be joined
@@ -217,6 +241,15 @@ _CARD_EX = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
 _CARD_MEGA_EX = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
 _CARD_TERA = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
 _CARD_ACE_SPEC = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+#: The quantities that actually decide Pokémon TCG lines, previously absent
+#: from the feature set entirely: printed HP (how much damage kills it),
+#: weakness/resistance (the x2 / -30 damage modifiers), and retreat cost (what
+#: escaping the Active Spot costs). Without these a policy has to memorize
+#: them per card id from the replays, which generalizes to nothing.
+_CARD_HP = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_RETREAT_COST = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_WEAKNESS = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
+_CARD_RESISTANCE = torch.zeros(CARD_ID_VOCAB_SIZE, dtype=torch.long)
 for _card in all_card_data():
     if _card.basic:
         _stage = CardStage.BASIC
@@ -233,6 +266,11 @@ for _card in all_card_data():
     _CARD_MEGA_EX[_card.cardId] = int(_card.megaEx)
     _CARD_TERA[_card.cardId] = int(_card.tera)
     _CARD_ACE_SPEC[_card.cardId] = int(_card.aceSpec)
+    _CARD_HP[_card.cardId] = _card.hp
+    _CARD_RETREAT_COST[_card.cardId] = _card.retreatCost
+    # +1 shift so 0 stays "none" (see CARD_WEAKNESS_VOCAB_SIZE).
+    _CARD_WEAKNESS[_card.cardId] = 0 if _card.weakness is None else _card.weakness + 1
+    _CARD_RESISTANCE[_card.cardId] = 0 if _card.resistance is None else _card.resistance + 1
 del _card, _stage
 
 #: ``stage`` is genuinely ordinal (BASIC < STAGE1 < STAGE2 — more evolved),
@@ -244,6 +282,63 @@ del _card, _stage
 #: ``BASIC`` (1) both map near the low end, which is an acceptable overlap
 #: since neither is "evolved."
 _CARD_STAGE_NORM = _CARD_STAGE.float() / (len(CardStage) - 1)
+
+#: Pre-normalized companions, same pattern as ``_CARD_STAGE_NORM`` — these are
+#: magnitudes, so they reach the model as floats in [0, 1] rather than as
+#: embedding indexes. Index 0 (the "no card" sentinel) is 0.0 in both, which
+#: is already the right answer for a card with no HP / no retreat cost.
+_CARD_HP_NORM = (_CARD_HP.float() / HP_CAP).clamp(0.0, 1.0)
+_CARD_RETREAT_COST_NORM = (_CARD_RETREAT_COST.float() / RETREAT_COST_CAP).clamp(0.0, 1.0)
+
+#: Per-``attack_id`` static lookups, the attack-side counterpart to the
+#: ``CardData`` tables above. ``attack_id`` previously reached the model only
+#: as the scalar ``attack_id / 10.0`` — an id used as a magnitude, so attack
+#: 1092 arrived as "109.2" and its 200 damage / 3-energy cost were nowhere in
+#: the input at all. Row 0 is the "no attack" sentinel (all zeros), which is
+#: also where ``NO_VALUE`` (-1) clamps to for non-attack options.
+def _build_attack_tables() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Built in a function rather than a module-level loop so the per-attack
+    loop variables don't leak into the module namespace."""
+    damage = torch.zeros(ATTACK_ID_VOCAB_SIZE, dtype=torch.long)
+    energy_cost = torch.zeros(ATTACK_ID_VOCAB_SIZE, dtype=torch.long)
+    energy_type_counts = torch.zeros((ATTACK_ID_VOCAB_SIZE, len(EnergyType)), dtype=torch.long)
+    for attack in all_attack():
+        damage[attack.attackId] = attack.damage
+        energy_cost[attack.attackId] = len(attack.energies)
+        # A count per energy type, not a multi-hot: a cost of {G}{C}{C} needs
+        # the 2 colorless distinguished from 1, exactly like
+        # ``_pad_energy_attached_chain`` already counts rather than flags.
+        for energy_type in attack.energies:
+            energy_type_counts[attack.attackId, energy_type] += 1
+    return damage, energy_cost, energy_type_counts
+
+
+_ATTACK_DAMAGE, _ATTACK_ENERGY_COST, _ATTACK_ENERGY_TYPE_COUNTS = _build_attack_tables()
+
+#: Damage shares ``HP_CAP`` with board/card HP on purpose — see ``HP_CAP``.
+_ATTACK_DAMAGE_NORM = (_ATTACK_DAMAGE.float() / HP_CAP).clamp(0.0, 1.0)
+_ATTACK_ENERGY_COST_NORM = (_ATTACK_ENERGY_COST.float() / ENERGY_COST_CAP).clamp(0.0, 1.0)
+_ATTACK_ENERGY_TYPE_COUNTS_NORM = (
+    _ATTACK_ENERGY_TYPE_COUNTS.float() / ENERGY_COST_CAP
+).clamp(0.0, 1.0)
+
+
+def attack_flags(attack_id: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Static ``Attack`` properties for a tensor of ``attack_id``s (any shape).
+
+    ``attack_id`` carries ``NO_VALUE`` (-1) on every option that isn't an
+    attack, which is not a legal index — clamping to row 0 resolves those to
+    the all-zero "no attack" row. The clamped ids come back as
+    ``attack_id_safe`` so the embedding lookup downstream doesn't have to
+    re-derive that, and so the clamp is applied in exactly one place.
+    """
+    safe = attack_id.clamp(min=0)
+    return {
+        "attack_id_safe": safe,
+        "attack_damage_norm": _ATTACK_DAMAGE_NORM[safe],
+        "attack_energy_cost_norm": _ATTACK_ENERGY_COST_NORM[safe],
+        "attack_energy_type_counts": _ATTACK_ENERGY_TYPE_COUNTS_NORM[safe],
+    }
 
 
 def card_type_flags(
@@ -270,6 +365,10 @@ def card_type_flags(
         "mega_ex": _CARD_MEGA_EX[card_id],
         "tera": _CARD_TERA[card_id],
         "ace_spec": _CARD_ACE_SPEC[card_id],
+        "hp_norm": _CARD_HP_NORM[card_id],
+        "retreat_cost_norm": _CARD_RETREAT_COST_NORM[card_id],
+        "weakness": _CARD_WEAKNESS[card_id],
+        "resistance": _CARD_RESISTANCE[card_id],
     }
     if fields is None:
         return all_flags

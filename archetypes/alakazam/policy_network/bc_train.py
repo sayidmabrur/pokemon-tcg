@@ -11,7 +11,6 @@ padding/masking is built.
 """
 
 import argparse
-import json
 import math
 import random
 import sys
@@ -26,7 +25,6 @@ from collate import collate_features, pad_stack
 from dataset import PolicyFeatureDataset, transform
 from precomputed_dataset import PrecomputedPolicyFeatureDataset
 from policy_experimental import (
-    DEFAULT_THRESHOLD,
     PolicyNetwork,
     decode_action,
     equivalence_mask,
@@ -101,56 +99,6 @@ def episode_split(
     for sample_idx, episode_id in enumerate(episode_ids):
         (val_idx if episode_id in val_episodes else train_idx).append(sample_idx)
     return train_idx, val_idx
-
-
-#: Thresholds swept by ``calibrate_threshold``. Weighted toward the low end
-#: because that is where the decision actually lives: with ~1 target option
-#: among N, useful probabilities cluster well below 0.5.
-_THRESHOLD_GRID = (0.02, 0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50)
-
-
-@torch.no_grad()
-def calibrate_threshold(
-    policy: PolicyNetwork, loader, device: str, grid=_THRESHOLD_GRID
-) -> tuple[float, dict[float, float]]:
-    """Pick the decode threshold that maximises exact-match on held-out data.
-
-    The threshold is not a modelling choice that can be reasoned out once and
-    hardcoded — it depends on how confident this particular checkpoint is,
-    which changes with every training run. Left at a fixed 0.5 it silently
-    turns "take a card" into "decline" on nearly half of the optional
-    selections (see ``DEFAULT_THRESHOLD``), so it is fit on data like any
-    other parameter, on the *validation* split so it isn't fit to noise the
-    model already memorised.
-
-    Returns the best threshold and the full sweep, so a flat curve (nothing
-    to gain) is distinguishable from a sharp peak (worth trusting).
-    """
-    policy.eval()
-    scores = {t: 0 for t in grid}
-    num_samples = 0
-
-    for features, targets in loader:
-        features = _to_device(features, device)
-        targets = targets.to(device)
-        options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        logits = policy(features)
-        min_count, max_count = selection_counts(features)
-        expert = [set(t.nonzero().flatten().tolist()) for t in targets]
-        for threshold in grid:
-            predictions = decode_action(
-                logits, options_mask, min_count, max_count, threshold=threshold
-            )
-            scores[threshold] += sum(
-                set(p) == e for p, e in zip(predictions, expert)
-            )
-        num_samples += targets.shape[0]
-
-    policy.train()
-    num_samples = max(num_samples, 1)
-    rates = {t: n / num_samples for t, n in scores.items()}
-    best = max(rates, key=rates.get)
-    return best, rates
 
 
 @torch.no_grad()
@@ -236,9 +184,8 @@ class _InProcessBCPolicy:
     the end-of-epoch duel measures the exact in-memory weights just
     trained, not a stale save from a previous epoch."""
 
-    def __init__(self, network: PolicyNetwork, threshold: float, device: str):
+    def __init__(self, network: PolicyNetwork, device: str):
         self.network = network
-        self.threshold = threshold
         self.device = device
         self.extractor = duel_inference.LiveFeatureExtractor()
         self.decisions = 0
@@ -254,14 +201,21 @@ class _InProcessBCPolicy:
             logits = self.network(features)
         min_count, max_count = selection_counts(features)
         options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
-        action = decode_action(
-            logits, options_mask, min_count, max_count, threshold=self.threshold
-        )[0]
+        action = decode_action(logits, options_mask, min_count, max_count)[0]
         self.extractor.record_action(action)
         self.decisions += 1
         if not action:
             self.empty_selections += 1
         return action
+
+
+def _deck_label(path: Path) -> str:
+    """Log-friendly deck path: enough of it to identify which deck, since
+    several archetypes' decklists are all named deck.csv."""
+    try:
+        return str(path.resolve().relative_to(duel_inference._REPO_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def run_epoch_duel(
@@ -278,7 +232,7 @@ def run_epoch_duel(
     expert labels. Slower than ``evaluate()`` since it runs the real game
     engine turn-by-turn, so keep ``episodes`` modest for a per-epoch check."""
     policy.eval()
-    challenger = _InProcessBCPolicy(policy, DEFAULT_THRESHOLD, device)
+    challenger = _InProcessBCPolicy(policy, device)
     seat_list = [0, 1] if seats == "both" else [int(seats)]
     per_seat = max(1, episodes // len(seat_list))
     wins, total = 0, 0
@@ -328,7 +282,12 @@ def train(
         duel_opponent_deck_ids = duel_inference.read_deck(duel_opponent_deck_path)
         print(
             f"end-of-epoch duel: {duel_episodes} episodes/epoch vs PolicyRuleBased "
-            f"({duel_deck_path.name} vs {duel_opponent_deck_path.name})",
+            # Parent-qualified, not just .name: the rule-based opponent's deck
+            # lives at crustle-agent-rule-based/deck.csv, whose basename is the
+            # bare "deck.csv" — indistinguishable in a log from the repo-root
+            # deck.csv, which is a different archetype entirely. Printing only
+            # the basename made a correct config read as a mirror match.
+            f"({_deck_label(duel_deck_path)} vs {_deck_label(duel_opponent_deck_path)})",
             flush=True,
         )
 
@@ -511,36 +470,15 @@ def train(
                 f"(best val exact={best_exact:.3f})",
                 flush=True,
             )
-            # Calibrate the *saved* weights, not the in-memory final-epoch
-            # ones — the threshold has to match the checkpoint that gets
-            # served, and those differ whenever the best epoch wasn't last.
-            policy.load_state_dict(torch.load(out, map_location=device))
-            write_threshold(policy, val_loader, device, out)
 
     return policy
-
-
-def write_threshold(policy: PolicyNetwork, val_loader, device: str, out: str) -> float:
-    """Calibrate and persist the decode threshold next to the weights."""
-    threshold, sweep = calibrate_threshold(policy, val_loader, device)
-    curve = "  ".join(f"{t:.2f}:{rate:.3f}" for t, rate in sorted(sweep.items()))
-    print(f"threshold sweep (exact-match): {curve}", flush=True)
-    meta_path = Path(f"{out}.meta.json")
-    meta_path.write_text(json.dumps({"threshold": threshold}, indent=2) + "\n")
-    print(
-        f"calibrated threshold={threshold:.2f} "
-        f"(exact={sweep[threshold]:.3f} vs {sweep[0.5]:.3f} at the old fixed 0.5) "
-        f"-> {meta_path}",
-        flush=True,
-    )
-    return threshold
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--parquet", default="data/policy_decisions.parquet")
     parser.add_argument("--player-name", default="Yushin Ito")
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
         "--grad-clip", type=float, default=1.0,
@@ -568,7 +506,7 @@ if __name__ == "__main__":
         "--val-frac", type=float, default=0.1,
         help="fraction of *episodes* (not rows) held out for validation; 0 disables it",
     )
-    parser.add_argument("--seed", type=int, default=0, help="controls the episode split")
+    parser.add_argument("--seed", type=int, default=42, help="controls the episode split")
     parser.add_argument("--no-shuffle", action="store_true", help="disable shuffling (debug)")
     parser.add_argument("--cached-row-groups", type=int, default=16)
     parser.add_argument(
@@ -603,34 +541,7 @@ if __name__ == "__main__":
         "--cached-shards", type=int, default=4,
         help="LRU shard cache size for --precomputed-dir (ignored otherwise)",
     )
-    parser.add_argument(
-        "--calibrate-only", default=None, metavar="CHECKPOINT",
-        help="skip training: calibrate an existing checkpoint's decode threshold "
-             "on the validation split and write <CHECKPOINT>.meta.json",
-    )
     args = parser.parse_args()
-
-    if args.calibrate_only:
-        # Same split (same --seed) the checkpoint was trained under, so the
-        # calibration set stays genuinely held out.
-        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        dataset = PolicyFeatureDataset(
-            args.parquet, player_name=args.player_name, transform=transform,
-            cached_row_groups=args.cached_row_groups,
-        )
-        _, val_idx = episode_split(dataset, args.val_frac, args.seed)
-        if not val_idx:
-            raise SystemExit("--val-frac 0 leaves nothing to calibrate on")
-        val_loader = torch.utils.data.DataLoader(
-            torch.utils.data.Subset(dataset, val_idx), batch_size=args.batch_size,
-            shuffle=False, collate_fn=collate_batch, num_workers=args.num_workers,
-        )
-        policy = PolicyNetwork().to(device)
-        policy.load_state_dict(torch.load(args.calibrate_only, map_location=device))
-        print(f"calibrating {args.calibrate_only} on {len(val_idx)} held-out samples",
-              flush=True)
-        write_threshold(policy, val_loader, device, args.calibrate_only)
-        raise SystemExit(0)
 
     # Saving lives inside train() now: with a validation split, the
     # checkpoint worth keeping is the best epoch, which only the loop knows.

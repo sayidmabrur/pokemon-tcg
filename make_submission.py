@@ -7,7 +7,6 @@ Produces ``submission/`` plus ``submission.zip`` containing:
     main.py                                  agent() entry point (inference)
     deck.csv                                 60 card ids
     bc_policy.pt                             trained weights
-    bc_policy.pt.meta.json                   decode threshold calibrated for them
     cg/                                      game engine (incl. native libs)
     archetypes/alakazam/policy_network/      feature pipeline + network
 
@@ -34,9 +33,11 @@ dependency on either passes an import-based check and fails at grading.
 """
 
 import argparse
+import hashlib
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -83,20 +84,6 @@ def build(deck: Path, checkpoint: Path, out_dir: Path, zip_path: Path | None) ->
     shutil.copy2(deck, out_dir / "deck.csv")
     shutil.copy2(checkpoint, out_dir / "bc_policy.pt")
 
-    # The calibrated decode threshold travels with the weights. Without it the
-    # bundle silently falls back to the library default, which is fitted to a
-    # different checkpoint — and a too-high threshold makes the agent decline
-    # optional effects rather than crash, so nothing would flag it.
-    meta = checkpoint.with_suffix(checkpoint.suffix + ".meta.json")
-    if meta.is_file():
-        shutil.copy2(meta, out_dir / "bc_policy.pt.meta.json")
-    else:
-        print(
-            f"  WARNING: no {meta.name} — the bundle will use the default decode\n"
-            f"  threshold, which was not calibrated for these weights. Fix with:\n"
-            f"    python archetypes/alakazam/policy_network/bc_train.py "
-            f"--calibrate-only {checkpoint}"
-        )
     for name in _CG_FILES:
         source = _ROOT / "cg" / name
         if source.is_file():
@@ -105,6 +92,17 @@ def build(deck: Path, checkpoint: Path, out_dir: Path, zip_path: Path | None) ->
             print(f"  note: cg/{name} not present, skipping")
     for name in _POLICY_FILES:
         shutil.copy2(_ROOT / _POLICY_DIR / name, out_dir / _POLICY_DIR / name)
+
+    # State the provenance of the weights, because "did my improvement make it
+    # into the bundle?" is otherwise unanswerable from this output. bc_train.py
+    # writes its best checkpoint to a *relative* --out (default ./bc_policy.pt),
+    # while this script defaults to checkpoints/ — so the two can silently
+    # diverge, and packaging a stale checkpoint produces a bundle that verifies
+    # green and plays like the old model.
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(checkpoint.stat().st_mtime))
+    digest = hashlib.md5(checkpoint.read_bytes()).hexdigest()[:12]
+    print(f"checkpoint: {checkpoint}")
+    print(f"  modified {stamp}, {checkpoint.stat().st_size / 1e6:.1f} MB, md5 {digest}")
 
     total = sum(f.stat().st_size for f in out_dir.rglob("*") if f.is_file())
     print(f"built {out_dir}/ — {total / 1e6:.1f} MB")
