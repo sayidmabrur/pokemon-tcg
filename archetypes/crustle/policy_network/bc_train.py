@@ -25,6 +25,7 @@ from collate import collate_features, pad_stack
 from dataset import PolicyFeatureDataset, transform
 from precomputed_dataset import PrecomputedPolicyFeatureDataset
 from policy_experimental import (
+    DEFAULT_DROPOUT,
     PolicyNetwork,
     decode_action,
     equivalence_mask,
@@ -140,7 +141,12 @@ def evaluate(policy: PolicyNetwork, loader, device: str) -> dict[str, float]:
         equivalent = equivalence_mask(
             features["decision_context"]["options"], targets, options_mask
         )
-        totals["loss"] += masked_selection_loss(logits, targets, options_mask).item()
+        # Same objective as the training loop (tie-group aware) — otherwise
+        # the two losses measure different things and the train/val gap, the
+        # whole point of watching them side by side, means nothing.
+        totals["loss"] += masked_selection_loss(
+            logits, targets, options_mask, equivalent
+        ).item()
         num_batches += 1
 
         # A masked-out position is -inf, so argmax can never land on one.
@@ -341,6 +347,8 @@ def train(
     player_name: str = "flg",
     epochs: int = 1,
     lr: float = 1e-3,
+    dropout: float = DEFAULT_DROPOUT,
+    weight_decay: float = 1e-2,
     grad_clip: float = 1.0,
     batch_size: int = 64,
     log_every: int = 0,
@@ -440,8 +448,34 @@ def train(
     )
     print(f"{len(loader)} batches/epoch, shuffle={shuffle}, num_workers={num_workers}", flush=True)
 
-    policy = PolicyNetwork().to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    policy = PolicyNetwork(dropout=dropout).to(device)
+    # AdamW, not Adam+weight_decay: under Adam the L2 term is folded into the
+    # adaptive denominator, so parameters with large gradient history get
+    # decayed less — the opposite of the intent. AdamW decouples it.
+    #
+    # Biases, LayerNorm and embedding tables are excluded. Decaying a bias or
+    # a LayerNorm gain just fights the layer's own calibration, and pulling
+    # embedding rows toward zero penalizes *rare* cards hardest (they get few
+    # gradient updates to counteract the decay) — exactly the ids where the
+    # model has least to spare.
+    decayed, not_decayed = [], []
+    for name, param in policy.named_parameters():
+        if not param.requires_grad:
+            continue
+        skip = param.ndim <= 1 or ".norm" in name or "embed" in name.lower()
+        (not_decayed if skip else decayed).append(param)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decayed, "weight_decay": weight_decay},
+            {"params": not_decayed, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
+    print(
+        f"dropout={dropout} weight_decay={weight_decay} "
+        f"({len(decayed)} decayed / {len(not_decayed)} exempt tensors)",
+        flush=True,
+    )
     # Linear warmup then cosine decay. The two sequence encoders are 8-layer
     # transformers; even pre-LN, a deep stack starting at full LR takes large
     # early steps on attention weights that are still random, which is what
@@ -476,6 +510,11 @@ def train(
         "epochs": epochs,
         "total_steps": total_steps,
         "num_train_samples": len(train_idx),
+        # Resuming across a change to either of these continues a model into a
+        # different regularization regime than the one that produced its
+        # weights — worth a warning, same as the rest.
+        "dropout": dropout,
+        "weight_decay": weight_decay,
     }
 
     if resume is not None:
@@ -519,7 +558,18 @@ def train(
             options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
 
             logits = policy(features)
-            loss = masked_selection_loss(logits, targets, options_mask)
+            # Score the expert's *play*, not the index they happened to click.
+            # Roughly half of single-select decisions offer a behaviourally
+            # identical alternative and the expert picks among them
+            # arbitrarily (see ``equivalence_mask``), so the index-specific
+            # objective spends gradient fitting coin flips — capacity burnt on
+            # noise, and the widening train/val gap that comes with it. The
+            # evaluation already credited the tie group (``top1eq``); this
+            # makes the training objective agree with it.
+            equivalent = equivalence_mask(
+                features["decision_context"]["options"], targets, options_mask
+            )
+            loss = masked_selection_loss(logits, targets, options_mask, equivalent)
 
             optimizer.zero_grad()
             loss.backward()
@@ -624,6 +674,16 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
+        "--dropout", type=float, default=DEFAULT_DROPOUT,
+        help="dropout for every MLP block and both transformer stacks "
+             "(0 disables it entirely)",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=1e-2,
+        help="AdamW decoupled weight decay; biases, norms and embeddings are "
+             "exempt (0 disables it)",
+    )
+    parser.add_argument(
         "--grad-clip", type=float, default=1.0,
         help="max global grad norm; the 8-layer sequence encoders are the "
              "reason this matters (see the schedule set up in train())",
@@ -704,6 +764,7 @@ if __name__ == "__main__":
     # checkpoint worth keeping is the best epoch, which only the loop knows.
     train(
         args.parquet, args.player_name, args.epochs, args.lr,
+        dropout=args.dropout, weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         batch_size=args.batch_size, log_every=args.log_every, limit=args.limit,
         device=args.device, num_workers=args.num_workers, shuffle=not args.no_shuffle,

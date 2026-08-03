@@ -35,6 +35,26 @@ from vocab import (
 
 D = 64  # shared embedding/hidden width
 
+#: Dropout probability, applied to every ReLU-terminated MLP block *and*
+#: passed explicitly to the two ``TransformerEncoderLayer`` stacks.
+#:
+#: The transformers always had this — ``nn.TransformerEncoderLayer`` defaults
+#: to ``dropout=0.1`` — but the MLP path (``CardEmbed``, the per-group encoder
+#: heads, ``fuse``) had none, so most of the parameter count was unregularized.
+#: That showed up as a widening train/val gap: on the crustle run, train loss
+#: fell monotonically 0.622 -> 0.564 over epochs 18-22 while val loss bottomed
+#: at 0.828 (epoch 19) and rose every epoch after, with val exact flat at
+#: ~0.71. Threading one value through makes the amount explicit and tunable
+#: from ``bc_train.py`` instead of being an inherited library default on some
+#: layers and absent on the rest.
+#:
+#: Every ``nn.Dropout`` below is *appended* after a block's trailing ReLU
+#: rather than inserted mid-``Sequential``, which keeps each ``Linear`` at the
+#: index it already had — so existing checkpoints still load. ``score`` is left
+#: alone deliberately: it emits the logits, and dropout on an output head just
+#: adds noise to the thing being ranked.
+DEFAULT_DROPOUT = 0.1
+
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """Mean-pool ``x`` (..., L, D) over L, respecting a bool ``mask`` (..., L).
@@ -124,7 +144,7 @@ class CardEmbed(nn.Module):
     Missing narrowed flags (e.g. an energy card has no ``stage``/``ex``) fall
     back to zeros so the same module works for full and narrowed joins."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
         self.id = nn.Embedding(CARD_ID_VOCAB_SIZE, dim)
         self.stage = nn.Embedding(CARD_STAGE_VOCAB_SIZE, dim // 4)
@@ -135,6 +155,7 @@ class CardEmbed(nn.Module):
         self.weakness = nn.Embedding(CARD_WEAKNESS_VOCAB_SIZE, dim // 4)
         self.resistance = nn.Embedding(CARD_RESISTANCE_VOCAB_SIZE, dim // 4)
         self.proj = nn.Linear(dim + 5 * (dim // 4) + 7, dim)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, fields: dict) -> torch.Tensor:
         """``fields`` is already sliced to plain keys (``id``/``stage``/...)
@@ -170,7 +191,7 @@ class CardEmbed(nn.Module):
             ],
             dim=-1,
         )
-        return F.relu(self.proj(out))
+        return self.drop(F.relu(self.proj(out)))
 
 
 def _card_fields(fields: dict, prefix: str) -> dict:
@@ -183,9 +204,9 @@ class OptionEncoder(nn.Module):
     """One option -> vector. Options are a *set* within a decision (order is
     meaningless — pooled with a mask), not a sequence."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.card = CardEmbed(dim)
+        self.card = CardEmbed(dim, dropout)
         self.type_embed = nn.Embedding(OPTION_TYPE_VOCAB_SIZE, dim // 4)
         self.area = nn.Embedding(AREA_VOCAB_SIZE, dim // 4)
         self.targets_opponent = nn.Embedding(TARGETS_OPPONENT_VOCAB_SIZE, dim // 4)
@@ -193,7 +214,8 @@ class OptionEncoder(nn.Module):
         # other id — it used to be fed as the scalar ``attack_id / 10.0``.
         self.attack = nn.Embedding(ATTACK_ID_VOCAB_SIZE, dim // 4)
         self.mlp = nn.Sequential(
-            nn.Linear(dim + 4 * (dim // 4) + 8 + len(EnergyType), dim), nn.ReLU()
+            nn.Linear(dim + 4 * (dim // 4) + 8 + len(EnergyType), dim), nn.ReLU(),
+            nn.Dropout(dropout),
         )
 
     def forward(self, options: dict) -> torch.Tensor:
@@ -239,13 +261,15 @@ class OptionEncoder(nn.Module):
 
 
 class SelectionEncoder(nn.Module):
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
         self.type_embed = nn.Embedding(SELECT_TYPE_VOCAB_SIZE, dim // 4)
         self.context = nn.Embedding(SELECT_CONTEXT_VOCAB_SIZE, dim // 4)
-        self.context_card = CardEmbed(dim)
-        self.effect_card = CardEmbed(dim)
-        self.mlp = nn.Sequential(nn.Linear(2 * dim + 2 * (dim // 4) + 5, dim), nn.ReLU())
+        self.context_card = CardEmbed(dim, dropout)
+        self.effect_card = CardEmbed(dim, dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * dim + 2 * (dim // 4) + 5, dim), nn.ReLU(), nn.Dropout(dropout)
+        )
 
     def forward(self, selection: dict) -> torch.Tensor:
         scalars = torch.stack(
@@ -272,10 +296,10 @@ class DecisionChainEncoder(nn.Module):
     """Actor's own last N decisions — a genuine temporal sequence, so this is
     the one group that gets a ``TransformerEncoder``."""
 
-    def __init__(self, dim=D, nhead=2, layers=8):
+    def __init__(self, dim=D, nhead=2, layers=8, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.option = OptionEncoder(dim)
-        self.selection = SelectionEncoder(dim)
+        self.option = OptionEncoder(dim, dropout)
+        self.selection = SelectionEncoder(dim, dropout)
         # 3 * dim: the menu summary, the selection, and *which option was
         # actually chosen* (see forward) — plus turn/turn_action_count.
         self.in_proj = nn.Linear(3 * dim + 2, dim)
@@ -285,7 +309,8 @@ class DecisionChainEncoder(nn.Module):
         # run to run; pre-LN is stable at depth on its own. bc_train.py adds
         # warmup and grad clipping on top.
         encoder_layer = nn.TransformerEncoderLayer(
-            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True
+            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True,
+            dropout=dropout,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, layers)
 
@@ -340,10 +365,10 @@ class DecisionContextEncoder(nn.Module):
     but this also exposes per-option vectors (for scoring against the
     pooled state to produce action logits), not just a pooled summary."""
 
-    def __init__(self, dim=D, nhead=2, layers=2):
+    def __init__(self, dim=D, nhead=2, layers=2, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.option = OptionEncoder(dim)
-        self.selection = SelectionEncoder(dim)
+        self.option = OptionEncoder(dim, dropout)
+        self.selection = SelectionEncoder(dim, dropout)
         # Self-attention *across the options of this decision*. Without it each
         # option is encoded in isolation and scored as ``score(option_i,
         # state)``, so option i never sees option j except through a mean-pooled
@@ -354,7 +379,8 @@ class DecisionContextEncoder(nn.Module):
         # (the ordering of the list carries no meaning beyond the index
         # pointer, which is already a feature).
         encoder_layer = nn.TransformerEncoderLayer(
-            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True
+            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True,
+            dropout=dropout,
         )
         self.option_attention = nn.TransformerEncoder(encoder_layer, layers)
 
@@ -376,12 +402,14 @@ class DecisionContextEncoder(nn.Module):
 class GlobalStateEncoder(nn.Module):
     """Fixed-size scalars/categoricals — a flat MLP, no sequence/set structure."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
         self.first_player = nn.Embedding(3, dim // 4)
         self.result = nn.Embedding(4, dim // 4)
-        self.stadium_card = CardEmbed(dim)
-        self.mlp = nn.Sequential(nn.Linear(2 * dim + 2 * (dim // 4) + 6, dim), nn.ReLU())
+        self.stadium_card = CardEmbed(dim, dropout)
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * dim + 2 * (dim // 4) + 6, dim), nn.ReLU(), nn.Dropout(dropout)
+        )
 
     def forward(self, global_state: dict) -> torch.Tensor:
         # ``looking_card``'s id field is ``looking_card_ids`` (plural, from
@@ -419,18 +447,19 @@ class GlobalStateEncoder(nn.Module):
 class PokemonEncoder(nn.Module):
     """One board Pokémon (active or bench slot) -> vector."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.card = CardEmbed(dim)
+        self.card = CardEmbed(dim, dropout)
         self.energy = nn.Embedding(len(EnergyType), dim // 4)
-        self.energy_card = CardEmbed(dim)
-        self.tool_card = CardEmbed(dim)
-        self.pre_evolution_card = CardEmbed(dim)
+        self.energy_card = CardEmbed(dim, dropout)
+        self.tool_card = CardEmbed(dim, dropout)
+        self.pre_evolution_card = CardEmbed(dim, dropout)
         # Every attached list is pooled mean+sum: how *many* energy are on a
         # Pokémon decides whether its attack is payable at all, and a mean
         # over the attached energy is identical for one Fire and three Fire.
         self.mlp = nn.Sequential(
-            nn.Linear(dim + 2 * (dim // 4) + 6 * dim + 2, dim), nn.ReLU()
+            nn.Linear(dim + 2 * (dim // 4) + 6 * dim + 2, dim), nn.ReLU(),
+            nn.Dropout(dropout),
         )
 
     def _pool_list(self, module, pokemon: dict, prefix: str) -> torch.Tensor:
@@ -459,16 +488,18 @@ class PlayerStateEncoder(nn.Module):
     Pokémon are a permutation-invariant *set*, so mean-pooled, not a
     sequence model."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.pokemon = PokemonEncoder(dim)
-        self.hand_card = CardEmbed(dim)
-        self.discard_card = CardEmbed(dim)
+        self.pokemon = PokemonEncoder(dim, dropout)
+        self.hand_card = CardEmbed(dim, dropout)
+        self.discard_card = CardEmbed(dim, dropout)
         # active (dim) + bench/hand/discard pooled mean+sum (2 * dim each) + 9
         # status scalars. Hand and bench counts are decision-critical: "a
         # second Ultra Ball" and "a fourth body on the bench" are exactly the
         # facts a mean pool erases.
-        self.mlp = nn.Sequential(nn.Linear(7 * dim + 9, dim), nn.ReLU())
+        self.mlp = nn.Sequential(
+            nn.Linear(7 * dim + 9, dim), nn.ReLU(), nn.Dropout(dropout)
+        )
 
     def _pool_cards(self, module, fields: dict, prefix: str) -> torch.Tensor:
         vecs = module(_card_fields(fields, prefix))  # (B, max_width, D)
@@ -507,19 +538,20 @@ class OpponentHistoryEncoder(nn.Module):
     """Per-opponent-turn diffs — a temporal sequence, so ``TransformerEncoder``
     again, with each turn's ragged card/Pokémon lists mean-pooled first."""
 
-    def __init__(self, dim=D, nhead=2, layers=8):
+    def __init__(self, dim=D, nhead=2, layers=8, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.discarded_card = CardEmbed(dim)
-        self.new_pokemon_card = CardEmbed(dim)
-        self.removed_pokemon_card = CardEmbed(dim)
-        self.energy_attached_card = CardEmbed(dim)
+        self.discarded_card = CardEmbed(dim, dropout)
+        self.new_pokemon_card = CardEmbed(dim, dropout)
+        self.removed_pokemon_card = CardEmbed(dim, dropout)
+        self.energy_attached_card = CardEmbed(dim, dropout)
         # 8 * dim: four card groups, each pooled as mean+sum (2 * dim apiece) —
         # "they discarded three Water Energy" is a different fact from
         # "they discarded a Water Energy", and a mean cannot tell them apart.
         self.in_proj = nn.Linear(8 * dim + 5 + 5, dim)
         self.position = ReversePositionalEmbedding(dim)
         encoder_layer = nn.TransformerEncoderLayer(
-            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True
+            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True,
+            dropout=dropout,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, layers)
 
@@ -738,10 +770,33 @@ def decode_action(
     and ``threshold`` cannot affect it at all.
 
     ``threshold`` only comes into play where the count is genuinely free:
-    optional selections (``minCount == 0``, where declining is legal) and
-    multi-select decisions (``maxCount > 1``) — exactly the cases the loss
-    still models as independent Bernoullis, so a per-option probability cut
-    is the matching decode there.
+    multi-select decisions (``maxCount > 1``), which the loss still models as
+    independent Bernoullis, so a per-option probability cut is the matching
+    decode there.
+
+    It is deliberately NOT allowed to empty a selection. ``minCount == 0``
+    decisions (an optional effect, e.g. a Pokédex or a Hilda) are the ones
+    where a low-confidence row could decode to nothing at all, and on those
+    the threshold is reading a quantity training never constrained: an
+    optional decision the expert *accepted* carries a single positive target,
+    so ``masked_selection_loss`` scores it through the softmax cross-entropy
+    branch — and softmax CE is invariant to adding a constant to every logit
+    in a row. Only the differences between logits are fit; the absolute level
+    is free, and the only thing pulling on it is the Bernoulli branch, whose
+    mostly-zero targets drag it down. ``sigmoid(logit) > threshold`` then asks
+    that unpinned level a question it cannot answer.
+
+    Measured on ``policy_decisions_crustle.parquet`` the damage is large: the
+    expert declines an optional selection 4.0% of the time, while the
+    unfloored decode returned nothing on 29.0% of them, and flooring the count
+    at one lifted exact-match on that subset from 61.0% to 82.0%.
+
+    The floor concedes the genuine declines (4.0%, hence the 96% ceiling it
+    implies) in exchange for the 25 points of spurious ones. Recovering them
+    properly means making "decline" an explicit null option so it competes
+    inside the same softmax the loss actually fits, rather than being inferred
+    from an uncalibrated absolute probability — that is a retrain, not a
+    decode change.
 
     Within the clamp options are taken in descending confidence, so when the
     threshold under-selects the next-most-confident options fill the gap, and
@@ -754,7 +809,9 @@ def decode_action(
     num_valid = options_mask.sum(-1)
 
     count = (probs > threshold).sum(-1)
-    count = torch.maximum(count, min_count)
+    # Floored at one, not at ``min_count`` — see above. ``num_valid`` still
+    # clamps it back to zero below for a decision offering no valid option.
+    count = torch.maximum(count, min_count.clamp(min=1))
     count = torch.minimum(count, max_count)
     count = torch.minimum(count, num_valid).clamp(min=0)
 
@@ -782,16 +839,16 @@ class PolicyNetwork(nn.Module):
     current decision's options against it (a pointer-style classifier over
     a variable-size option set, not a fixed action space)."""
 
-    def __init__(self, dim=D):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
         super().__init__()
-        self.decision_chain = DecisionChainEncoder(dim)
-        self.decision_context = DecisionContextEncoder(dim)
-        self.global_state = GlobalStateEncoder(dim)
-        self.opponent_history = OpponentHistoryEncoder(dim)
-        self.player_state = PlayerStateEncoder(dim)  # shared weights: self & opponent boards
+        self.decision_chain = DecisionChainEncoder(dim, dropout=dropout)
+        self.decision_context = DecisionContextEncoder(dim, dropout=dropout)
+        self.global_state = GlobalStateEncoder(dim, dropout)
+        self.opponent_history = OpponentHistoryEncoder(dim, dropout=dropout)
+        self.player_state = PlayerStateEncoder(dim, dropout)  # shared weights: self & opponent boards
         # 7*dim: decision_chain + ctx_pooled (2*dim) + global_state +
         # opponent_history + own board + opponent board.
-        self.fuse = nn.Sequential(nn.Linear(7 * dim, dim), nn.ReLU())
+        self.fuse = nn.Sequential(nn.Linear(7 * dim, dim), nn.ReLU(), nn.Dropout(dropout))
         self.score = nn.Sequential(nn.Linear(2 * dim, dim), nn.ReLU(), nn.Linear(dim, 1))
 
     def forward(self, features: dict):

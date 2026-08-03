@@ -25,6 +25,7 @@ from collate import collate_features, pad_stack
 from dataset import PolicyFeatureDataset, transform
 from precomputed_dataset import PrecomputedPolicyFeatureDataset
 from policy_experimental import (
+    DEFAULT_DROPOUT,
     PolicyNetwork,
     decode_action,
     equivalence_mask,
@@ -251,6 +252,8 @@ def train(
     player_name: str = "Yushin Ito",
     epochs: int = 1,
     lr: float = 1e-3,
+    dropout: float = DEFAULT_DROPOUT,
+    weight_decay: float = 1e-2,
     grad_clip: float = 1.0,
     batch_size: int = 64,
     log_every: int = 0,
@@ -349,8 +352,34 @@ def train(
     )
     print(f"{len(loader)} batches/epoch, shuffle={shuffle}, num_workers={num_workers}", flush=True)
 
-    policy = PolicyNetwork().to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
+    policy = PolicyNetwork(dropout=dropout).to(device)
+    # AdamW, not Adam+weight_decay: under Adam the L2 term is folded into the
+    # adaptive denominator, so parameters with large gradient history get
+    # decayed less — the opposite of the intent. AdamW decouples it.
+    #
+    # Biases, LayerNorm and embedding tables are excluded. Decaying a bias or
+    # a LayerNorm gain just fights the layer's own calibration, and pulling
+    # embedding rows toward zero penalizes *rare* cards hardest (they get few
+    # gradient updates to counteract the decay) — exactly the ids where the
+    # model has least to spare.
+    decayed, not_decayed = [], []
+    for name, param in policy.named_parameters():
+        if not param.requires_grad:
+            continue
+        skip = param.ndim <= 1 or ".norm" in name or "embed" in name.lower()
+        (not_decayed if skip else decayed).append(param)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decayed, "weight_decay": weight_decay},
+            {"params": not_decayed, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
+    print(
+        f"dropout={dropout} weight_decay={weight_decay} "
+        f"({len(decayed)} decayed / {len(not_decayed)} exempt tensors)",
+        flush=True,
+    )
     # Linear warmup then cosine decay. The two sequence encoders are 8-layer
     # transformers; even pre-LN, a deep stack starting at full LR takes large
     # early steps on attention weights that are still random, which is what
@@ -481,6 +510,16 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
+        "--dropout", type=float, default=DEFAULT_DROPOUT,
+        help="dropout for every MLP block and both transformer stacks "
+             "(0 disables it entirely)",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=1e-2,
+        help="AdamW decoupled weight decay; biases, norms and embeddings are "
+             "exempt (0 disables it)",
+    )
+    parser.add_argument(
         "--grad-clip", type=float, default=1.0,
         help="max global grad norm; the 8-layer sequence encoders are the "
              "reason this matters (see the schedule set up in train())",
@@ -547,6 +586,7 @@ if __name__ == "__main__":
     # checkpoint worth keeping is the best epoch, which only the loop knows.
     train(
         args.parquet, args.player_name, args.epochs, args.lr,
+        dropout=args.dropout, weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         batch_size=args.batch_size, log_every=args.log_every, limit=args.limit,
         device=args.device, num_workers=args.num_workers, shuffle=not args.no_shuffle,
