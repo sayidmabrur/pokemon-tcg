@@ -162,7 +162,26 @@ echo
 
 cd "$OUTPUT_DIR"
 
+# Is this episode already on disk?
+#
+# `kaggle competitions replay` names its output "episode-<id>-replay.json",
+# not "<id>.json" — so a check against the bare id never matches and every
+# run re-downloads the whole submission (~900 episodes for the larger ones).
+# The legacy bare-id name is still accepted so anything fetched under an
+# older layout keeps counting as present.
+#
+# -s, not -f: a download killed partway leaves a zero-byte file behind, and
+# treating that as "already downloaded" would cache the failure permanently.
+# An empty file is retried instead.
+have_replay() {
+    local episode_id="$1"
+    [[ -s "episode-${episode_id}-replay.json" ]] || [[ -s "${episode_id}.json" ]]
+}
+
 CURRENT=1
+SKIPPED=0
+DOWNLOADED=0
+FAILED=0
 
 while read -r EPISODE_ID; do
 
@@ -170,14 +189,15 @@ while read -r EPISODE_ID; do
 
     echo "[$CURRENT/$COUNT] Episode ${EPISODE_ID}"
 
-    if [[ -f "${EPISODE_ID}.json" ]]; then
-        echo "  Already downloaded."
+    if have_replay "$EPISODE_ID"; then
+        echo "  Already downloaded — skipping."
+        ((SKIPPED++))
+    elif kaggle competitions replay "$EPISODE_ID"; then
+        echo "  Downloaded."
+        ((DOWNLOADED++))
     else
-        if kaggle competitions replay "$EPISODE_ID"; then
-            echo "  Downloaded."
-        else
-            echo "  Failed."
-        fi
+        echo "  Failed."
+        ((FAILED++))
     fi
 
     ((CURRENT++))
@@ -193,4 +213,7 @@ echo "========================================"
 echo "Finished!"
 echo "Submission : ${SUBMISSION_ID}"
 echo "Saved to   : ${OUTPUT_DIR}"
+echo "Skipped    : ${SKIPPED} (already present)"
+echo "Downloaded : ${DOWNLOADED}"
+echo "Failed     : ${FAILED}"
 echo "========================================"
