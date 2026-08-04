@@ -24,7 +24,7 @@ For value function, the goal is only to predict accumulated reward, so I think v
 
 # Training goals
 
-## Stage 1: Supervised learning through imitation cloning.
+## Stage 1: Supervised learning through imitation learning.
 Pretrained the policy with imitation learning as a starting point. So it's not stuck at exploiting weak model when self-play training
 ## Stage 2: RL Training using Imperfect Information Games Method (Nash Equilibrium Convergence)
 the goal is to converge to NE, and producing unexploitable strategy across different decks. If it's only able to be unexploitable against 1 or 2 decks will be a good sign.
