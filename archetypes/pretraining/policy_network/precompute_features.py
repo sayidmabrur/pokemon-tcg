@@ -21,7 +21,7 @@ config to training.
 """
 
 import argparse
-import io
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -29,6 +29,7 @@ from pathlib import Path
 import torch
 import torch.utils.data
 
+import flat_codec
 from dataset import PolicyFeatureDataset, transform
 from observation import DEFAULT_SPEC
 
@@ -52,10 +53,41 @@ from observation import DEFAULT_SPEC
 #: unchanged, so nothing downstream would raise on a v2 cache — it would just
 #: silently train on zeroed card identity. Hence the bump: this guard is the
 #: only thing that catches a values-only change.
-CACHE_FORMAT = "bin-v3"
+#:
+#: ``bin-v4`` keeps the layout *and the values* of v3 and changes only how one
+#: sample's tensors are packed into its bytes: ``flat_codec`` instead of
+#: ``torch.save``. Measured on the pretraining cache, v3 stored a sample whose
+#: tensors hold 21 KB of numbers in a 269 KB blob (12.8x, all zip-record
+#: overhead for ~600 tiny tensors) and spent 26 ms of CPU per sample parsing it
+#: back — against a 115 ms GPU step for a whole batch of 64, which is why
+#: training stayed loader-bound *after* the precompute removed
+#: ``transform()``. v4 is ~12x smaller on disk (which also lets the page cache
+#: hold a meaningful fraction of it) and decodes to ``torch.frombuffer`` views.
+#: Repack an existing v3 cache with ``--repack`` — pure I/O, no feature rebuild.
+#: ``bin-v5`` adds per-record zlib compression to v4's flat encoding — another
+#: 52x on real records, because the payload is dominated by structural zeros
+#: (padded card slots, a repeating 60-deep decision chain, one all-zero float
+#: field worth a sixth of the bytes). The full pretraining cache goes ~130GB ->
+#: ~2.5GB, which is the difference between reading it off disk every epoch and
+#: having the page cache hold all of it. Decompression is 0.25ms/sample against
+#: ~2.3ms for the rest of the decode, so it is close to free.
+CACHE_FORMAT = "bin-v5"
+
+#: The format ``--repack`` reads. Still supported by
+#: ``PrecomputedPolicyFeatureDataset`` so an interrupted repack leaves you with
+#: a cache you can still train from.
+LEGACY_PICKLE_FORMAT = "bin-v3"
 
 #: All sample blobs concatenated, addressed by ``manifest["offsets"]``.
 BLOB_FILENAME = "blobs.bin"
+
+
+#: Skeleton keys this worker has already shipped to the parent. A skeleton is
+#: ~10 KB of JSON and there are only ~36 distinct ones (one per
+#: ``(own bench count, opponent bench count)`` pair), so sending one per *sample*
+#: would put more bytes on the IPC queue than the samples themselves. Sending it
+#: once per worker per distinct shape costs at most 36 x num_workers messages.
+_SENT_SKELETONS: set[str] = set()
 
 
 def _serialize_collate(batch):
@@ -80,11 +112,26 @@ def _serialize_collate(batch):
 
     ``episode_id`` is returned alongside, unserialized, so building the
     manifest doesn't require unpacking the blob.
+
+    Returns ``(episode_id, skeleton_key, skeleton_or_None, compressed_body)``.
+    The template index is not part of the body: only the parent sees every
+    sample, so only the parent can assign indexes, and by this point the body is
+    already compressed (see ``_stream_records``). The skeleton itself rides along
+    the first time this worker encounters its shape.
     """
     observation, target_action = batch[0]
-    buffer = io.BytesIO()
-    torch.save((observation["features"], observation["meta"], target_action), buffer)
-    return observation["meta"]["episode_id"], buffer.getvalue()
+    skeleton, body = flat_codec.encode(
+        observation["features"], observation["meta"], target_action
+    )
+    key = hashlib.blake2b(skeleton.encode(), digest_size=8).hexdigest()
+    first_time = key not in _SENT_SKELETONS
+    _SENT_SKELETONS.add(key)
+    return (
+        observation["meta"]["episode_id"],
+        key,
+        skeleton if first_time else None,
+        body,
+    )
 
 
 def precompute(
@@ -122,46 +169,79 @@ def precompute(
         collate_fn=_serialize_collate,
     )
 
+    episode_ids, offsets, templates = _stream_records(loader, out, len(dataset))
+    _write_manifest(
+        out, episode_ids, offsets, player_name, parquet_path,
+        opponent_history_size, decision_chain_size, templates=templates,
+    )
+
+
+def _stream_records(loader, out: Path, total: int) -> tuple[list, list[int], list]:
+    """Drain a ``_serialize_collate`` loader into ``out/blobs.bin``.
+
+    Returns ``(episode_ids, offsets, templates)`` for the manifest. The template
+    registry is built here rather than in the workers because index assignment
+    has to be global; it is prepended to each compressed body on the way past,
+    which is why the index sits outside the compressed region.
+    """
     episode_ids = []
     # Cumulative byte offsets, so sample i occupies [offsets[i], offsets[i+1]).
     # One entry longer than the sample count; no separate length array needed.
     offsets = [0]
+    template_index: dict[str, int] = {}
+    templates: list = []
     t0 = time.time()
 
     with open(out / BLOB_FILENAME, "wb") as blobs:
-        for i, (episode_id, blob) in enumerate(loader):
+        for i, (episode_id, key, skeleton, body) in enumerate(loader):
+            index = template_index.get(key)
+            if index is None:
+                if skeleton is None:
+                    # Only reachable if a worker's dedup memo and the parent's
+                    # registry disagree, which would mean the record points at
+                    # a template that was never stored.
+                    raise RuntimeError(
+                        f"sample {i} references unknown feature-shape {key} and "
+                        f"carried no skeleton"
+                    )
+                index = template_index[key] = len(templates)
+                templates.append(json.loads(skeleton))
+            record = flat_codec.pack(index, body)
+
             episode_ids.append(episode_id)
-            blobs.write(blob)
-            offsets.append(offsets[-1] + len(blob))
+            blobs.write(record)
+            offsets.append(offsets[-1] + len(record))
             if (i + 1) % 5000 == 0:
                 elapsed = time.time() - t0
                 done = i + 1
                 rate = done / elapsed
                 print(
-                    f"  {done}/{len(dataset)} ({elapsed:.0f}s, {rate:.1f} samples/s, "
+                    f"  {done}/{total} ({elapsed:.0f}s, {rate:.1f} samples/s, "
                     f"{offsets[-1] / 1e9:.1f}GB written, "
-                    f"eta {(len(dataset) - done) / max(rate, 1e-9) / 60:.0f}min, "
-                    f"~{offsets[-1] / done * len(dataset) / 1e9:.0f}GB total)",
+                    f"{len(templates)} feature shapes, "
+                    f"eta {(total - done) / max(rate, 1e-9) / 60:.0f}min, "
+                    f"~{offsets[-1] / done * total / 1e9:.0f}GB total)",
                     flush=True,
                 )
 
-    _write_manifest(
-        out, episode_ids, offsets, player_name, parquet_path,
-        opponent_history_size, decision_chain_size,
-    )
     print(
         f"wrote {len(episode_ids)} samples, {offsets[-1] / 1e9:.1f}GB to "
         f"{out / BLOB_FILENAME} in {time.time() - t0:.0f}s",
         flush=True,
     )
+    return episode_ids, offsets, templates
 
 
 def _write_manifest(
     out: Path, episode_ids: list, offsets: list[int], player_name,
     parquet_path, opponent_history_size, decision_chain_size,
+    templates: list | None = None, cache_format: str = CACHE_FORMAT,
 ) -> None:
     manifest = {
-        "format": CACHE_FORMAT,
+        "format": cache_format,
+        # The per-shape feature skeletons every record's ``sig`` field indexes
+        # into (see flat_codec). Absent for the legacy pickled format.
+        "templates": templates,
         "num_samples": len(episode_ids),
         "offsets": offsets,
         "episode_ids": episode_ids,
@@ -214,15 +294,81 @@ def convert_from_shards(cache_dir: str) -> None:
             f"recovered {len(offsets) - 1} samples but the manifest claims "
             f"{manifest['num_samples']} — refusing to overwrite it"
         )
+    # Still the pickled per-sample format — this only re-lays-out the blobs it
+    # was handed. Run --repack afterwards to get the current format.
     _write_manifest(
         directory, manifest["episode_ids"], offsets, manifest["player_name"],
         manifest["parquet_path"], manifest["opponent_history_size"],
-        manifest["decision_chain_size"],
+        manifest["decision_chain_size"], cache_format=LEGACY_PICKLE_FORMAT,
     )
     print(
         f"wrote {directory / BLOB_FILENAME} ({offsets[-1] / 1e9:.1f}GB) in "
         f"{time.time() - t0:.0f}s\nthe old shards are now unused — reclaim them with:\n"
         f"  rm {directory}/shard_*.pt",
+        flush=True,
+    )
+
+
+def repack(src_dir: str, out_dir: str, num_workers: int = 8) -> None:
+    """Rewrite a ``bin-v3`` (pickled-per-sample) cache into ``bin-v4``.
+
+    Like ``convert_from_shards``, this does **not** rebuild features: the
+    expensive ``build_observation()``/``transform()`` work is already baked into
+    the stored samples, so this just decodes each one and re-encodes it with
+    ``flat_codec``. Values are bit-identical and sample order is preserved, so
+    the episode-level train/val split for a given ``--seed`` is unchanged and an
+    in-progress run can carry straight on against the new directory with
+    ``bc_train.py --resume``.
+
+    Writes to a *separate* ``out_dir`` and leaves the source untouched, so a
+    failed or interrupted repack costs nothing but disk. Delete the source once
+    you have trained a batch against the result.
+
+    The wall-clock cost is dominated by unpickling the old blobs (~26 ms of CPU
+    per sample), which is why this fans out over ``num_workers`` — reads are
+    sequential, so the I/O side is not the constraint.
+    """
+    from precomputed_dataset import PrecomputedPolicyFeatureDataset
+
+    source = Path(src_dir)
+    out = Path(out_dir)
+    if out.resolve() == source.resolve():
+        raise SystemExit(
+            "--repack writes a new cache; point --out at a different directory "
+            "so an interrupted run cannot destroy the source"
+        )
+    out.mkdir(parents=True, exist_ok=True)
+
+    dataset = PrecomputedPolicyFeatureDataset(source, warn_legacy=False)
+    manifest = dataset.manifest
+    print(
+        f"repacking {len(dataset)} samples from {source} "
+        f"(format {manifest['format']}) into {out}",
+        flush=True,
+    )
+    # shuffle=False so records land in source order and the manifest's
+    # episode_ids/sample indexes keep meaning the same thing.
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=1, shuffle=False, num_workers=num_workers,
+        collate_fn=_serialize_collate,
+    )
+    episode_ids, offsets, templates = _stream_records(loader, out, len(dataset))
+
+    if episode_ids != list(manifest["episode_ids"]):
+        raise SystemExit(
+            "repacked episode_ids do not match the source manifest — refusing to "
+            "write a manifest whose split would differ from the original's"
+        )
+    _write_manifest(
+        out, episode_ids, offsets, manifest["player_name"], manifest["parquet_path"],
+        manifest["opponent_history_size"], manifest["decision_chain_size"],
+        templates=templates,
+    )
+    before = manifest["offsets"][-1]
+    print(
+        f"{before / 1e9:.1f}GB -> {offsets[-1] / 1e9:.1f}GB "
+        f"({before / max(offsets[-1], 1):.1f}x smaller). Train against {out}, "
+        f"then reclaim the old cache with:\n  rm -r {source}",
         flush=True,
     )
 
@@ -260,7 +406,18 @@ if __name__ == "__main__":
     parser.add_argument("--opponent-history-size", type=int, default=None)
     parser.add_argument("--decision-chain-size", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None, help="cap dataset size (debug)")
+    parser.add_argument(
+        "--repack", default=None, metavar="CACHE_DIR",
+        help="skip feature building: re-encode an existing 'bin-v3' cache in "
+             "CACHE_DIR into the current format, writing to --out. ~12x smaller "
+             "and ~20x cheaper to decode (see CACHE_FORMAT), values identical, "
+             "so a run in progress can --resume straight onto the result.",
+    )
     args = parser.parse_args()
+
+    if args.repack:
+        repack(args.repack, args.out, num_workers=args.num_workers)
+        raise SystemExit(0)
 
     if args.from_shards:
         convert_from_shards(args.from_shards)

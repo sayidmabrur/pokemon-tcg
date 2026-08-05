@@ -47,12 +47,15 @@ from pathlib import Path
 import torch
 import torch.multiprocessing
 import torch.utils.data
+from tqdm.auto import tqdm
 
 from collate import collate_features, pad_stack
 from dataset import PolicyFeatureDataset, transform
 from precomputed_dataset import PrecomputedPolicyFeatureDataset
 from policy_experimental import (
+    D,
     DEFAULT_DROPOUT,
+    FF_MULT,
     PolicyNetwork,
     decode_action,
     equivalence_mask,
@@ -101,12 +104,73 @@ def _to_device(obj, device):
     ``.to(device)`` only works on a single tensor — this recurses through
     the nested dicts the real structure is built from."""
     if isinstance(obj, torch.Tensor):
-        return obj.to(device)
+        # non_blocking pairs with the loader's pin_memory: from pinned host
+        # memory the copy is handed to the GPU's copy engine and returns
+        # immediately, so the ~520 tensors of a batch queue up instead of the
+        # CPU blocking on each one in turn. From pageable memory it silently
+        # does nothing, which is why both settings are applied together.
+        return obj.to(device, non_blocking=True)
     if isinstance(obj, dict):
         return {k: _to_device(v, device) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_to_device(v, device) for v in obj]
     return obj
+
+
+class _Run:
+    """Optional Weights & Biases run, plus a no-op stand-in for when it is off.
+
+    A pretraining run is hours long over hundreds of thousands of samples, so
+    the per-epoch print lines are a poor way to see whether the loss curve has
+    flattened or the train/val gap has opened. This logs the same numbers, at
+    step granularity for the training loss and epoch granularity for everything
+    else, and is a no-op unless ``--wandb-project`` is passed — nothing about
+    training depends on it.
+
+    Resuming reattaches to the *same* run rather than starting a second one, via
+    the run id stored in the resume sidecar. Otherwise a job that gets
+    interrupted three times shows up as four disjoint partial curves, none of
+    which can be read.
+    """
+
+    def __init__(self, project: str | None, name: str | None, config: dict, run_id: str | None):
+        self.run = None
+        if project is None:
+            return
+        try:
+            import wandb
+        except ImportError as error:  # pragma: no cover - depends on the env
+            raise SystemExit(
+                f"--wandb-project needs the wandb package ({error}); pip install "
+                f"wandb, or drop the flag to train without logging"
+            ) from error
+        self.run = wandb.init(
+            project=project,
+            name=name,
+            config=config,
+            # resume="allow" rather than "must": a sidecar written before wandb
+            # was switched on has no run id, and that should start a fresh run
+            # rather than abort the training job.
+            id=run_id,
+            resume="allow" if run_id else None,
+        )
+        print(f"wandb: logging to {self.run.url}", flush=True)
+
+    @property
+    def id(self) -> str | None:
+        return self.run.id if self.run is not None else None
+
+    def log(self, metrics: dict, step: int | None = None) -> None:
+        if self.run is not None:
+            self.run.log(metrics, step=step)
+
+    def summary(self, **values) -> None:
+        if self.run is not None:
+            self.run.summary.update(values)
+
+    def finish(self) -> None:
+        if self.run is not None:
+            self.run.finish()
 
 
 def episode_split(
@@ -273,6 +337,7 @@ def save_resume(
     best_exact: float,
     best_epoch: int,
     provenance: dict,
+    wandb_run_id: str | None = None,
 ) -> None:
     """Write the state needed to continue training at ``next_epoch``.
 
@@ -291,6 +356,10 @@ def save_resume(
             "next_epoch": next_epoch,
             "best_exact": best_exact,
             "best_epoch": best_epoch,
+            # Not part of ``provenance``: a changed run id is not a
+            # misconfiguration worth warning about, it just means this resume
+            # will reattach to that run's curves (see _Run).
+            "wandb_run_id": wandb_run_id,
             **provenance,
         },
         path,
@@ -304,9 +373,9 @@ def load_resume(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: str,
     provenance: dict,
-) -> tuple[int, float, int]:
+) -> tuple[int, float, int, str | None]:
     """Restore ``policy``/``optimizer``/``scheduler`` in place; return
-    ``(start_epoch, best_exact, best_epoch)``.
+    ``(start_epoch, best_exact, best_epoch, wandb_run_id)``.
 
     The provenance checks below are warnings, not errors, because every one
     of them describes a run that will still train — just not the run the
@@ -338,7 +407,12 @@ def load_resume(
             "resumed run is not identical to an uninterrupted one",
             flush=True,
         )
-    return state["next_epoch"], state["best_exact"], state["best_epoch"]
+    return (
+        state["next_epoch"],
+        state["best_exact"],
+        state["best_epoch"],
+        state.get("wandb_run_id"),
+    )
 
 
 def run_epoch_duel(
@@ -375,6 +449,8 @@ def train(
     player_name: str | None = None,
     epochs: int = 1,
     lr: float = 1e-3,
+    dim: int = D,
+    ff_mult: int = FF_MULT,
     dropout: float = DEFAULT_DROPOUT,
     weight_decay: float = 1e-2,
     grad_clip: float = 1.0,
@@ -395,6 +471,9 @@ def train(
     precomputed_dir: str | None = None,
     cached_shards: int = 4,
     resume: str | None = None,
+    wandb_project: str | None = None,
+    wandb_name: str | None = None,
+    progress: bool = True,
 ) -> PolicyNetwork:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"training on {device}, batch_size={batch_size}", flush=True)
@@ -462,21 +541,59 @@ def train(
     # confound between runs, not confirmed either way. Benchmark this
     # yourself with --log-every and compare a few --num-workers values
     # before trusting any specific setting.
+    # This model is tiny (2.4M params) and the per-sample work is not, so
+    # training is loader-bound, not compute-bound: measured mid-run on an
+    # RTX 3060, the GPU sat at 1% utilisation while four workers held 95% CPU
+    # each. The knobs below exist to keep the GPU fed, and they matter far
+    # more here than anything about the model.
+    #
+    # pin_memory: host->device copies out of pageable memory cannot overlap
+    # compute, so the copy serialises against the step. Pinned staging buffers
+    # let it run on the copy engine, which is what makes the
+    # ``non_blocking=True`` in ``_to_device`` do anything at all — the two are
+    # a pair and neither helps alone.
+    #
+    # persistent_workers: without it every epoch re-forks the whole worker
+    # pool, and each fresh worker re-opens the precomputed blob and rebuilds
+    # its offsets. Over 20 epochs that is 20 pointless teardowns of state that
+    # never changes.
+    #
+    # prefetch_factor is deliberately left at torch's default of 2.
+    #
+    # Raising it looks free and is not: the samples held in host RAM are
+    # ``num_workers * prefetch_factor * batch_size``, so it multiplies against
+    # two knobs the caller also controls. Setting it to 4 alongside
+    # ``--num-workers 8 --batch-size 256`` buffered 8192 samples instead of
+    # 256 — a 32x increase, each sample ~520 tensors — which drove a 16GB box
+    # 12.5GB into swap. GPU utilisation then oscillated 1%-79% as the workers
+    # stalled on page faults, i.e. worse than the thin queue it was meant to
+    # fix. On this hardware RAM is the binding constraint, not core count.
+    loader_kwargs: dict = {"num_workers": num_workers}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+    if device.startswith("cuda"):
+        loader_kwargs["pin_memory"] = True
+
     loader = torch.utils.data.DataLoader(
         train_set, batch_size=batch_size, shuffle=shuffle, collate_fn=collate_batch,
-        num_workers=num_workers,
+        **loader_kwargs,
     )
     val_loader = (
         torch.utils.data.DataLoader(
             val_set, batch_size=batch_size, shuffle=False, collate_fn=collate_batch,
-            num_workers=num_workers,
+            **loader_kwargs,
         )
         if val_set is not None
         else None
     )
     print(f"{len(loader)} batches/epoch, shuffle={shuffle}, num_workers={num_workers}", flush=True)
 
-    policy = PolicyNetwork(dropout=dropout).to(device)
+    policy = PolicyNetwork(dim=dim, ff_mult=ff_mult, dropout=dropout).to(device)
+    print(
+        f"model: dim={dim} ff_mult={ff_mult} "
+        f"({sum(p.numel() for p in policy.parameters()) / 1e6:.1f}M params)",
+        flush=True,
+    )
     # AdamW, not Adam+weight_decay: under Adam the L2 term is folded into the
     # adaptive denominator, so parameters with large gradient history get
     # decayed less — the opposite of the intent. AdamW decouples it.
@@ -527,6 +644,7 @@ def train(
     best_exact = -1.0
     best_epoch = -1
     start_epoch = 0
+    resumed_run_id = None
 
     # Recorded alongside the weights so a resume can tell the user when the
     # run being continued was configured differently from the one being
@@ -543,6 +661,12 @@ def train(
         # weights — worth a warning, same as the rest.
         "dropout": dropout,
         "weight_decay": weight_decay,
+        # Unlike the rest of provenance these are not merely "a different run":
+        # load_state_dict raises on a shape mismatch, so a resume across a
+        # change here fails loudly before training starts. Recorded so the
+        # warning names the cause rather than leaving a torch shape error.
+        "dim": dim,
+        "ff_mult": ff_mult,
     }
 
     if resume is not None:
@@ -552,7 +676,7 @@ def train(
                 f"every epoch as '<--out>.resume', so a run that has not "
                 f"finished an epoch yet has nothing to resume from"
             )
-        start_epoch, best_exact, best_epoch = load_resume(
+        start_epoch, best_exact, best_epoch, resumed_run_id = load_resume(
             resume, policy, optimizer, scheduler, device, provenance
         )
         print(
@@ -575,12 +699,49 @@ def train(
         # visited once per epoch), but it means bit-exact reproduction of a
         # crashed run is not on offer.
 
+    run = _Run(
+        wandb_project,
+        wandb_name,
+        {
+            **provenance,
+            "lr": lr,
+            "grad_clip": grad_clip,
+            "num_workers": num_workers,
+            "device": device,
+            "shuffle": shuffle,
+            "num_val_samples": len(val_idx),
+            "batches_per_epoch": len(loader),
+            "player_name": player_name,
+            "precomputed_dir": precomputed_dir,
+            "parquet_path": parquet_path if precomputed_dir is None else None,
+            "duel_episodes": duel_episodes,
+            "params": sum(p.numel() for p in policy.parameters()),
+        },
+        resumed_run_id,
+    )
+    # The x-axis for every logged metric. Derived from start_epoch rather than
+    # counted from 0 so a resumed run's points land after the ones already
+    # logged, instead of overwriting them.
+    global_step = start_epoch * len(loader)
+
     for epoch in range(start_epoch, epochs):
         total_loss = 0.0
         total_grad_norm = 0.0
         num_batches = 0
         t_epoch = time.time()
-        for i, (features, targets) in enumerate(loader):
+        # leave=False so an N-epoch run doesn't end with N stale bars; the
+        # per-epoch summary line below is the permanent record. Disabled
+        # entirely under --no-progress, which is what you want when stdout is a
+        # log file rather than a terminal.
+        bar = tqdm(
+            loader,
+            desc=f"epoch {epoch}/{epochs - 1}",
+            unit="batch",
+            disable=not progress,
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for i, (features, targets) in enumerate(bar):
             features = _to_device(features, device)
             targets = targets.to(device)
             options_mask = features["decision_context"]["options"]["options_mask"].squeeze(1)
@@ -608,15 +769,40 @@ def train(
             optimizer.step()
             scheduler.step()
 
-            total_loss += loss.item()
+            batch_loss = loss.item()
+            total_loss += batch_loss
             total_grad_norm += float(grad_norm)
             num_batches += 1
+            global_step += 1
+
+            # One .item() per batch either way (batch_loss above), so the bar
+            # and the wandb point are free relative to the step itself.
+            current_lr = optimizer.param_groups[0]["lr"]
+            if progress:
+                bar.set_postfix(
+                    loss=f"{batch_loss:.4f}",
+                    avg=f"{total_loss / num_batches:.4f}",
+                    lr=f"{current_lr:.2e}",
+                    refresh=False,
+                )
+            run.log(
+                {
+                    "train/loss": batch_loss,
+                    "train/lr": current_lr,
+                    "train/grad_norm": float(grad_norm),
+                    "epoch": epoch,
+                },
+                step=global_step,
+            )
             # log_every=0 (the default) reports once per epoch instead of
             # mid-epoch. The per-epoch line below carries the same numbers
             # aggregated, so nothing is lost by leaving this off.
             if log_every and (i + 1) % log_every == 0:
                 elapsed = time.time() - t_epoch
-                print(
+                # tqdm.write, not print: a bare print into a live bar's terminal
+                # interleaves with the bar's own carriage returns and leaves the
+                # line half-overwritten.
+                (tqdm.write if progress else print)(
                     f"epoch {epoch} batch {i + 1}/{len(loader)}: "
                     f"avg loss={total_loss / num_batches:.4f}, "
                     f"lr={optimizer.param_groups[0]['lr']:.2e} "
@@ -625,6 +811,7 @@ def train(
                     flush=True,
                 )
 
+        bar.close()
         train_loss = total_loss / max(num_batches, 1)
         epoch_seconds = time.time() - t_epoch
         print(
@@ -634,6 +821,18 @@ def train(
             f"({num_batches} batches, {epoch_seconds:.0f}s, "
             f"{epoch_seconds / max(num_batches, 1):.2f}s/batch)",
             flush=True,
+        )
+        # Logged against the epoch's last step so the epoch-granularity series
+        # share an x-axis with the per-batch training loss.
+        run.log(
+            {
+                "epoch/train_loss": train_loss,
+                "epoch/grad_norm": total_grad_norm / max(num_batches, 1),
+                "epoch/seconds": epoch_seconds,
+                "epoch/seconds_per_batch": epoch_seconds / max(num_batches, 1),
+                "epoch": epoch,
+            },
+            step=global_step,
         )
 
         if duel_episodes > 0:
@@ -645,6 +844,15 @@ def train(
                 f"{duel_result['wins']}/{duel_result['episodes']} = {duel_result['rate']:.1%} "
                 f"(declined {duel_result['empty_rate']:.1%})",
                 flush=True,
+            )
+            run.log(
+                {
+                    "duel/win_rate": duel_result["rate"],
+                    "duel/empty_rate": duel_result["empty_rate"],
+                    "duel/episodes": duel_result["episodes"],
+                    "epoch": epoch,
+                },
+                step=global_step,
             )
 
         if val_loader is not None:
@@ -659,6 +867,17 @@ def train(
                 f"exact={metrics['exact']:.3f} count_mae={metrics['count_mae']:.2f}",
                 flush=True,
             )
+            run.log(
+                {
+                    **{f"val/{key}": value for key, value in metrics.items()},
+                    # The gap, not just the two curves: it is the number that
+                    # says "stop", and eyeballing it off two separate panels is
+                    # how overfitting gets noticed an epoch late.
+                    "val/train_gap": metrics["loss"] - train_loss,
+                    "epoch": epoch,
+                },
+                step=global_step,
+            )
             # Select on exact-match, the metric closest to "submits the move the
             # expert submitted" — val loss keeps improving on the easy negatives
             # after the actual decisions have stopped getting better.
@@ -667,6 +886,7 @@ def train(
                 best_epoch = epoch
                 torch.save(policy.state_dict(), out)
                 print(f"  saved {out} (best exact={best_exact:.3f})", flush=True)
+                run.summary(best_exact=best_exact, best_epoch=best_epoch)
 
         # Written after validation so the sidecar's best_exact/best_epoch
         # already account for this epoch — otherwise a resume would forget
@@ -676,7 +896,7 @@ def train(
             save_resume(
                 resume_path(out), policy, optimizer, scheduler,
                 next_epoch=epoch + 1, best_exact=best_exact, best_epoch=best_epoch,
-                provenance=provenance,
+                provenance=provenance, wandb_run_id=run.id,
             )
 
     if out is not None:
@@ -692,6 +912,9 @@ def train(
                 flush=True,
             )
 
+    # Without this the process can sit for a while at exit while wandb flushes,
+    # or drop the tail of the run if it is killed there.
+    run.finish()
     return policy
 
 
@@ -705,6 +928,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--dim", type=int, default=D,
+        help="shared embedding/hidden width. The pretraining run at the default "
+             "64 underfits: it drives train loss to 0.46 on a 5k subset while "
+             "barely separating train (0.662) from val (0.678) on the full 601k, "
+             "which is capacity-bound, not overfitting. Widening is also cheap "
+             "here because the step is kernel-launch-bound, not compute-bound",
+    )
+    parser.add_argument(
+        "--ff-mult", type=int, default=FF_MULT,
+        help="transformer feed-forward width as a multiple of --dim (2 is the "
+             "original, 4 is the usual choice)",
+    )
     parser.add_argument(
         "--dropout", type=float, default=DEFAULT_DROPOUT,
         help="dropout for every MLP block and both transformer stacks "
@@ -788,6 +1024,22 @@ if __name__ == "__main__":
              "Keep --seed and --val-frac identical to the original run or the "
              "train/val episode split moves and validation stops being held out.",
     )
+    parser.add_argument(
+        "--wandb-project", default=None, metavar="PROJECT",
+        help="log to this Weights & Biases project (off unless passed). Logs "
+             "per-batch loss/lr/grad-norm and per-epoch train/val/duel metrics. "
+             "A --resume reattaches to the same run via the id in the sidecar, "
+             "so an interrupted job stays one continuous set of curves.",
+    )
+    parser.add_argument(
+        "--wandb-name", default=None, metavar="NAME",
+        help="run name within the project; wandb picks a random one if unset",
+    )
+    parser.add_argument(
+        "--no-progress", action="store_true",
+        help="disable the tqdm progress bar (use when stdout is a log file — the "
+             "per-epoch summary lines are printed either way)",
+    )
     args = parser.parse_args()
 
     # --resume with no value means "the sidecar belonging to --out", which
@@ -798,6 +1050,7 @@ if __name__ == "__main__":
     # checkpoint worth keeping is the best epoch, which only the loop knows.
     train(
         args.parquet, args.player_name, args.epochs, args.lr,
+        dim=args.dim, ff_mult=args.ff_mult,
         dropout=args.dropout, weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         batch_size=args.batch_size, log_every=args.log_every, limit=args.limit,
@@ -808,4 +1061,6 @@ if __name__ == "__main__":
         duel_deck=args.duel_deck, duel_opponent_deck=args.duel_opponent_deck,
         precomputed_dir=args.precomputed_dir, cached_shards=args.cached_shards,
         resume=resume,
+        wandb_project=args.wandb_project, wandb_name=args.wandb_name,
+        progress=not args.no_progress,
     )

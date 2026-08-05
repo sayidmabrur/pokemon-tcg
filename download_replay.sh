@@ -183,6 +183,14 @@ SKIPPED=0
 DOWNLOADED=0
 FAILED=0
 
+# Counters use `X=$((X + 1))`, never `((X++))`.
+#
+# `((X++))` is a post-increment: it evaluates to the value *before* the
+# increment, and an arithmetic expansion evaluating to 0 is exit status 1.
+# Under the `set -e` at the top of this file that aborts the whole script the
+# very first time a counter goes 0 -> 1, which reads as "downloaded one
+# episode and silently quit". The assignment form returns 0 whatever the
+# value, so it is safe from zero.
 while read -r EPISODE_ID; do
 
     [[ -z "$EPISODE_ID" ]] && continue
@@ -191,16 +199,16 @@ while read -r EPISODE_ID; do
 
     if have_replay "$EPISODE_ID"; then
         echo "  Already downloaded — skipping."
-        ((SKIPPED++))
+        SKIPPED=$((SKIPPED + 1))
     elif kaggle competitions replay "$EPISODE_ID"; then
         echo "  Downloaded."
-        ((DOWNLOADED++))
+        DOWNLOADED=$((DOWNLOADED + 1))
     else
         echo "  Failed."
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 
-    ((CURRENT++))
+    CURRENT=$((CURRENT + 1))
 
 done <<< "$EPISODES"
 

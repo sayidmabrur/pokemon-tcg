@@ -1,0 +1,102 @@
+_wandb:
+    value:
+        cli_version: 0.28.1
+        e:
+            cpq7wcd9ma8vex2xxuvfc7j3o8cndgtd:
+                args:
+                    - --precomputed-dir
+                    - ../../../data/precomputed_features_pretraining
+                    - --limit
+                    - "64"
+                    - --epochs
+                    - "1"
+                    - --batch-size
+                    - "32"
+                    - --num-workers
+                    - "2"
+                    - --val-frac
+                    - "0"
+                    - --out
+                    - /tmp/wandb_smoke.pt
+                    - --wandb-project
+                    - pokemon-tcg-bc
+                    - --wandb-name
+                    - smoke
+                    - --no-progress
+                codePath: archetypes/pretraining/policy_network/bc_train.py
+                codePathLocal: bc_train.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                disk:
+                    /:
+                        total: "965910667264"
+                        used: "764990435328"
+                email: sayid.10121012@mahasiswa.unikom.ac.id
+                executable: /home/capon/miniconda3/envs/kaggle-pokemon/bin/python
+                git:
+                    commit: 34601cacfded90fc175547babceadb4c3cc4813e
+                    remote: https://github.com/sayidmabrur/pokemon-tcg.git
+                host: archlinux
+                memory:
+                    total: "16678006784"
+                os: Linux-7.0.9-arch1-1-x86_64-with-glibc2.43
+                program: /home/capon/projects/kaggle/pokemon-tcg-rl-submission-untouched/archetypes/pretraining/policy_network/bc_train.py
+                python: CPython 3.12.13
+                root: /home/capon/projects/kaggle/pokemon-tcg-rl-submission-untouched/archetypes/pretraining/policy_network
+                startedAt: "2026-08-04T08:36:05.168588Z"
+                writerId: cpq7wcd9ma8vex2xxuvfc7j3o8cndgtd
+        m: []
+        python_version: 3.12.13
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 13
+                - 16
+                - 61
+            "4": 3.12.13
+            "5": 0.28.1
+            "12": 0.28.1
+            "13": linux-x86_64
+batch_size:
+    value: 32
+batches_per_epoch:
+    value: 2
+device:
+    value: cuda
+dropout:
+    value: 0.1
+duel_episodes:
+    value: 0
+epochs:
+    value: 1
+grad_clip:
+    value: 1
+lr:
+    value: 0.001
+num_train_samples:
+    value: 64
+num_val_samples:
+    value: 0
+num_workers:
+    value: 2
+params:
+    value: 2416897
+parquet_path:
+    value: null
+player_name:
+    value: null
+precomputed_dir:
+    value: ../../../data/precomputed_features_pretraining
+seed:
+    value: 42
+shuffle:
+    value: true
+total_steps:
+    value: 2
+val_frac:
+    value: 0
+weight_decay:
+    value: 0.01

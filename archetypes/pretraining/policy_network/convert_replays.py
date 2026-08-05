@@ -1,8 +1,19 @@
 """Convert Kaggle Pokémon TCG replay JSON files into policy-decision Parquet.
 
-Usage (pretraining copy — a directory of replays, every player kept):
-    python archetypes/pretraining/policy_network/convert_replays.py \
-        replays/pretraining data/policy_decisions_pretraining.parquet
+Usage (pretraining copy — the whole replay tree, every player kept):
+    python archetypes/pretraining/policy_network/convert_replays.py
+
+Both arguments default to the only pair this stage ever wants: ``replays/``
+in, ``data/policy_decisions_pretraining.parquet`` out. Replays live one level
+down, as ``replays/<submission id>/episode-<id>-replay.json``, and the source
+is walked recursively — so the default sweeps every submission directory in
+one pass and picks up new ones with no change to the command.
+
+Converting a single ``replays/<submission id>/`` is possible but rarely what
+you want: a submission directory contains only the games *that* submission
+played, so it is a slice of the field rather than the field. The overlap
+between those directories is also why ``replay_paths`` deduplicates — an
+episode is listed under every submission that took part in it.
 
 Nothing here filters by player or by decklist: the pretraining stage wants
 both seats of every game (see bc_train.py's docstring). The per-archetype
@@ -21,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -173,10 +185,48 @@ def decision_rows(replay_path: Path) -> tuple[list[dict[str, Any]], int]:
 
 
 def replay_paths(source: Path) -> Iterable[Path]:
+    """Every replay under ``source``, at most once per episode.
+
+    ``rglob`` so a root like ``replays/`` sweeps all the per-submission
+    subdirectories at once, which is the normal way to build the pretraining
+    parquet.
+
+    The dedup matters because those subdirectories overlap: an episode is
+    listed under *every* submission that took part in it, so downloading two
+    of your own submissions fetches the games between them twice. Measured on
+    the current tree, 3715 files hold 3566 distinct episodes — 149 duplicates.
+    Writing both copies would not corrupt the train/val split (``episode_split``
+    keys on ``episode_id``, so the copies land on the same side) but it would
+    silently give those episodes double weight in the loss, which is a
+    sampling bias nobody asked for.
+
+    Keyed on the ``episode-<id>-replay.json`` filename rather than on the
+    parsed ``EpisodeId``, so duplicates cost nothing to detect — the point is
+    to skip the parse, and a 15GB tree makes that worth doing. Files not
+    matching that pattern are always kept: an unrecognised name is not
+    evidence of a duplicate.
+    """
     if source.is_file():
         yield source
-    else:
-        yield from sorted(source.rglob("*.json"))
+        return
+
+    seen: set[str] = set()
+    for path in sorted(source.rglob("*.json")):
+        # Two layouts in the wild: ``replays/<submission>/episode-<id>-replay.json``
+        # from a per-submission download, and ``data/episodes/<date>/<id>.json``
+        # from the daily Kaggle dumps. Both name the episode in the filename, so
+        # both can be deduplicated without parsing. The daily dumps do not
+        # currently repeat an episode across dates (checked: 26321 files, 26321
+        # distinct ids), but they overlap by construction if you re-download a
+        # date, and double-weighting an episode in the loss is silent.
+        match = re.fullmatch(r"episode-(\d+)-replay\.json|(\d+)\.json", path.name)
+        if match is not None:
+            match = re.match(r"(\d+)", match.group(1) or match.group(2))
+        if match is not None:
+            if match.group(1) in seen:
+                continue
+            seen.add(match.group(1))
+        yield path
 
 
 def convert(
@@ -198,12 +248,27 @@ def convert(
     schema = make_schema(pa)
     batch: list[dict[str, Any]] = []
     dropped_episodes = 0
+    unreadable: list[Path] = []
     destination.parent.mkdir(parents=True, exist_ok=True)
     writer = pq.ParquetWriter(destination, schema, compression=compression)
     written = 0
     try:
         for path in paths:
-            episode_rows, episode_rejected = decision_rows(path)
+            try:
+                episode_rows, episode_rejected = decision_rows(path)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
+                # A replay that will not parse is almost always a truncated
+                # download, not a bug: the daily dumps are 20GB each and an
+                # interrupted transfer leaves a file that looks complete until
+                # the last few bytes. Measured on the first full tree, exactly
+                # 1 of 26321 files was affected — so aborting the whole run for
+                # it would throw away 6 hours of work over 0.004% of the data.
+                # Skipped and *counted*, because a silently shrinking dataset is
+                # the failure mode this would otherwise become: if a re-download
+                # goes badly wrong, the tally at the end is what tells you.
+                unreadable.append(path)
+                print(f"  skipping unreadable {path}: {error}", flush=True)
+                continue
             if episode_rejected:
                 # A rejected pairing means this episode's action/observation
                 # sequence is broken; keeping its other decisions would bias
@@ -223,13 +288,27 @@ def convert(
             writer.write_table(pa.Table.from_pylist([], schema=schema))
     finally:
         writer.close()
-    return len(paths), written, dropped_episodes
+    return len(paths), written, dropped_episodes, unreadable
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path, help="Replay JSON file or directory of replay JSON files")
-    parser.add_argument("destination", type=Path, help="Output .parquet file")
+    # Both positionals are optional here, and the defaults are the whole
+    # pipeline: every replay on disk -> the parquet the pretraining stage
+    # reads. Naming one ``replays/<submission id>/`` is the thing you almost
+    # never want, because a submission directory holds only the games that
+    # submission played — converting one in isolation silently trains on a
+    # slice of the field rather than all of it.
+    parser.add_argument(
+        "source", type=Path, nargs="?", default=Path("replays"),
+        help="replay JSON file, or a directory walked recursively "
+             "(default: %(default)s — every submission directory at once)",
+    )
+    parser.add_argument(
+        "destination", type=Path, nargs="?",
+        default=Path("data/policy_decisions_pretraining.parquet"),
+        help="output .parquet file (default: %(default)s)",
+    )
     parser.add_argument("--batch-size", type=int, default=5_000, help="Rows buffered before writing")
     parser.add_argument(
         "--compression",
@@ -239,10 +318,22 @@ def main() -> None:
     )
     args = parser.parse_args()
     compression = None if args.compression == "none" else args.compression
-    files, rows, dropped_episodes = convert(args.source, args.destination, args.batch_size, compression)
+    files, rows, dropped_episodes, unreadable = convert(
+        args.source, args.destination, args.batch_size, compression
+    )
     print(f"Wrote {rows} decision rows from {files} replay file(s) to {args.destination}.")
     if dropped_episodes:
         print(f"Dropped {dropped_episodes} episode(s) containing an unmatched/invalid pending decision.")
+    if unreadable:
+        print(
+            f"Skipped {len(unreadable)} unreadable replay file(s) — almost "
+            f"certainly truncated downloads. Re-download these dates and re-run "
+            f"to recover them:"
+        )
+        for path in unreadable[:20]:
+            print(f"  {path}")
+        if len(unreadable) > 20:
+            print(f"  ... and {len(unreadable) - 20} more")
 
 
 if __name__ == "__main__":

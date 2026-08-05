@@ -1,0 +1,49 @@
+{
+  "os":  "Linux-7.0.9-arch1-1-x86_64-with-glibc2.43",
+  "python":  "CPython 3.12.13",
+  "startedAt":  "2026-08-04T08:36:05.168588Z",
+  "args":  [
+    "--precomputed-dir",
+    "../../../data/precomputed_features_pretraining",
+    "--limit",
+    "64",
+    "--epochs",
+    "1",
+    "--batch-size",
+    "32",
+    "--num-workers",
+    "2",
+    "--val-frac",
+    "0",
+    "--out",
+    "/tmp/wandb_smoke.pt",
+    "--wandb-project",
+    "pokemon-tcg-bc",
+    "--wandb-name",
+    "smoke",
+    "--no-progress"
+  ],
+  "program":  "/home/capon/projects/kaggle/pokemon-tcg-rl-submission-untouched/archetypes/pretraining/policy_network/bc_train.py",
+  "codePath":  "archetypes/pretraining/policy_network/bc_train.py",
+  "codePathLocal":  "bc_train.py",
+  "git":  {
+    "remote":  "https://github.com/sayidmabrur/pokemon-tcg.git",
+    "commit":  "34601cacfded90fc175547babceadb4c3cc4813e"
+  },
+  "email":  "sayid.10121012@mahasiswa.unikom.ac.id",
+  "root":  "/home/capon/projects/kaggle/pokemon-tcg-rl-submission-untouched/archetypes/pretraining/policy_network",
+  "host":  "archlinux",
+  "executable":  "/home/capon/miniconda3/envs/kaggle-pokemon/bin/python",
+  "cpu_count":  6,
+  "cpu_count_logical":  12,
+  "disk":  {
+    "/":  {
+      "total":  "965910667264",
+      "used":  "764990435328"
+    }
+  },
+  "memory":  {
+    "total":  "16678006784"
+  },
+  "writerId":  "cpq7wcd9ma8vex2xxuvfc7j3o8cndgtd"
+}

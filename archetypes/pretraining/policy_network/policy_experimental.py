@@ -35,6 +35,15 @@ from vocab import (
 
 D = 64  # shared embedding/hidden width
 
+#: Transformer feed-forward width as a multiple of ``dim``. 2 was the original
+#: value; the usual choice is 4, and on this hardware the difference is close to
+#: free — the model is small enough that each step is dominated by *kernel
+#: launch* overhead rather than arithmetic, so making existing layers wider
+#: costs far less wall-clock than adding more of them. Overridable per model,
+#: and recovered from a checkpoint's shapes by ``load_policy``, so raising it
+#: does not orphan older weights.
+FF_MULT = 2
+
 #: Dropout probability, applied to every ReLU-terminated MLP block *and*
 #: passed explicitly to the two ``TransformerEncoderLayer`` stacks.
 #:
@@ -296,8 +305,11 @@ class DecisionChainEncoder(nn.Module):
     """Actor's own last N decisions — a genuine temporal sequence, so this is
     the one group that gets a ``TransformerEncoder``."""
 
-    def __init__(self, dim=D, nhead=2, layers=8, dropout=DEFAULT_DROPOUT):
+    def __init__(self, dim=D, nhead=2, layers=8, dropout=DEFAULT_DROPOUT, ff_mult=FF_MULT):
         super().__init__()
+        # Kept so the empty-sequence path in forward() can size its zeros from
+        # *this encoder's* width rather than the module-level default.
+        self.dim = dim
         self.option = OptionEncoder(dim, dropout)
         self.selection = SelectionEncoder(dim, dropout)
         # 3 * dim: the menu summary, the selection, and *which option was
@@ -309,7 +321,7 @@ class DecisionChainEncoder(nn.Module):
         # run to run; pre-LN is stable at depth on its own. bc_train.py adds
         # warmup and grad clipping on top.
         encoder_layer = nn.TransformerEncoderLayer(
-            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True,
+            dim, nhead, dim_feedforward=ff_mult * dim, batch_first=True, norm_first=True,
             dropout=dropout,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, layers)
@@ -317,7 +329,7 @@ class DecisionChainEncoder(nn.Module):
     def forward(self, decision_chain: dict) -> torch.Tensor:
         chain_mask = decision_chain["chain_mask"]  # (B, chain_len)
         if chain_mask.shape[1] == 0:  # every sample in the batch has an empty chain
-            return torch.zeros(chain_mask.shape[0], D, device=chain_mask.device)
+            return torch.zeros(chain_mask.shape[0], self.dim, device=chain_mask.device)
         option_vecs = self.option(decision_chain["options"])  # (B, chain_len, max_options, D)
         option_summary = _masked_mean(option_vecs, decision_chain["options"]["options_mask"])
         selection_summary = self.selection(decision_chain["selection"])  # (B, chain_len, D)
@@ -365,8 +377,9 @@ class DecisionContextEncoder(nn.Module):
     but this also exposes per-option vectors (for scoring against the
     pooled state to produce action logits), not just a pooled summary."""
 
-    def __init__(self, dim=D, nhead=2, layers=2, dropout=DEFAULT_DROPOUT):
+    def __init__(self, dim=D, nhead=2, layers=2, dropout=DEFAULT_DROPOUT, ff_mult=FF_MULT):
         super().__init__()
+        self.dim = dim
         self.option = OptionEncoder(dim, dropout)
         self.selection = SelectionEncoder(dim, dropout)
         # Self-attention *across the options of this decision*. Without it each
@@ -379,7 +392,7 @@ class DecisionContextEncoder(nn.Module):
         # (the ordering of the list carries no meaning beyond the index
         # pointer, which is already a feature).
         encoder_layer = nn.TransformerEncoderLayer(
-            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True,
+            dim, nhead, dim_feedforward=ff_mult * dim, batch_first=True, norm_first=True,
             dropout=dropout,
         )
         self.option_attention = nn.TransformerEncoder(encoder_layer, layers)
@@ -538,8 +551,9 @@ class OpponentHistoryEncoder(nn.Module):
     """Per-opponent-turn diffs — a temporal sequence, so ``TransformerEncoder``
     again, with each turn's ragged card/Pokémon lists mean-pooled first."""
 
-    def __init__(self, dim=D, nhead=2, layers=8, dropout=DEFAULT_DROPOUT):
+    def __init__(self, dim=D, nhead=2, layers=8, dropout=DEFAULT_DROPOUT, ff_mult=FF_MULT):
         super().__init__()
+        self.dim = dim
         self.discarded_card = CardEmbed(dim, dropout)
         self.new_pokemon_card = CardEmbed(dim, dropout)
         self.removed_pokemon_card = CardEmbed(dim, dropout)
@@ -550,7 +564,7 @@ class OpponentHistoryEncoder(nn.Module):
         self.in_proj = nn.Linear(8 * dim + 5 + 5, dim)
         self.position = ReversePositionalEmbedding(dim)
         encoder_layer = nn.TransformerEncoderLayer(
-            dim, nhead, dim_feedforward=2 * dim, batch_first=True, norm_first=True,
+            dim, nhead, dim_feedforward=ff_mult * dim, batch_first=True, norm_first=True,
             dropout=dropout,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, layers)
@@ -558,7 +572,7 @@ class OpponentHistoryEncoder(nn.Module):
     def forward(self, history: dict) -> torch.Tensor:
         history_mask = history["history_mask"]  # (B, chain_len)
         if history_mask.shape[1] == 0:  # every sample in the batch has empty history
-            return torch.zeros(history_mask.shape[0], D, device=history_mask.device)
+            return torch.zeros(history_mask.shape[0], self.dim, device=history_mask.device)
         discarded = _masked_mean_sum(
             self.discarded_card(_card_fields(history, "discarded_card")), history["discarded_mask"]
         )
@@ -743,10 +757,48 @@ def masked_bce_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Ten
 DEFAULT_THRESHOLD = 0.15
 
 
+def policy_shape(state_dict: dict) -> tuple[int, int]:
+    """Recover ``(dim, ff_mult)`` from a checkpoint's tensor shapes.
+
+    Checkpoints are bare ``state_dict``s — that is what every consumer reads
+    (``duel_inference``, the submission loader), and wrapping them in a config
+    dict would break all of them. So the architecture is inferred from the
+    weights instead, which keeps a wider model loadable everywhere with no
+    format change and no flag to remember.
+
+    Only these two are recoverable, and that is why they are the only knobs
+    exposed: ``nhead`` and ``layers`` do not change any tensor's shape, so a
+    checkpoint cannot describe them. Leave those at their defaults unless you
+    are prepared to thread a config file through every call site.
+    """
+    fuse = state_dict["fuse.0.weight"]                      # (dim, 7 * dim)
+    dim = fuse.shape[0]
+    if fuse.shape[1] != 7 * dim:
+        raise ValueError(
+            f"fuse.0.weight is {tuple(fuse.shape)}, which is not (dim, 7*dim) "
+            f"for any dim — this is not a PolicyNetwork checkpoint"
+        )
+    linear1 = state_dict["decision_chain.transformer.layers.0.linear1.weight"]
+    ff_mult, remainder = divmod(linear1.shape[0], dim)
+    if remainder:
+        raise ValueError(
+            f"feed-forward width {linear1.shape[0]} is not a whole multiple of "
+            f"dim {dim}"
+        )
+    return dim, ff_mult
+
+
 def load_policy(checkpoint, map_location="cpu") -> "PolicyNetwork":
-    """Load a checkpoint's weights, ready for inference."""
-    network = PolicyNetwork()
-    network.load_state_dict(torch.load(checkpoint, map_location=map_location))
+    """Load a checkpoint's weights, ready for inference.
+
+    The architecture comes from the checkpoint itself (``policy_shape``), so a
+    model trained at a different width loads here without this call site — or
+    the submission's — having to be told.
+    """
+    state_dict = torch.load(checkpoint, map_location=map_location)
+    dim, ff_mult = policy_shape(state_dict)
+    network = PolicyNetwork(dim=dim, ff_mult=ff_mult)
+    network.load_state_dict(state_dict)
     network.eval()
     return network
 
@@ -839,12 +891,12 @@ class PolicyNetwork(nn.Module):
     current decision's options against it (a pointer-style classifier over
     a variable-size option set, not a fixed action space)."""
 
-    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT):
+    def __init__(self, dim=D, dropout=DEFAULT_DROPOUT, ff_mult=FF_MULT):
         super().__init__()
-        self.decision_chain = DecisionChainEncoder(dim, dropout=dropout)
-        self.decision_context = DecisionContextEncoder(dim, dropout=dropout)
+        self.decision_chain = DecisionChainEncoder(dim, dropout=dropout, ff_mult=ff_mult)
+        self.decision_context = DecisionContextEncoder(dim, dropout=dropout, ff_mult=ff_mult)
         self.global_state = GlobalStateEncoder(dim, dropout)
-        self.opponent_history = OpponentHistoryEncoder(dim, dropout=dropout)
+        self.opponent_history = OpponentHistoryEncoder(dim, dropout=dropout, ff_mult=ff_mult)
         self.player_state = PlayerStateEncoder(dim, dropout)  # shared weights: self & opponent boards
         # 7*dim: decision_chain + ctx_pooled (2*dim) + global_state +
         # opponent_history + own board + opponent board.
