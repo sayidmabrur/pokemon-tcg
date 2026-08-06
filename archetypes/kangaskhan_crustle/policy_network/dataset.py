@@ -44,11 +44,11 @@ class PolicyFeatureDataset(Dataset):
         internal option index the opponent never actually gets to observe
         about themselves; diffed against ``EMPTY_BOARD_STATE`` for their
         first captured turn so every entry has the same shape. The default
-        ``opponent_history_size`` of 60 is above any realistic turn count, so
-        it covers the whole match; pass 0 to switch the group off.
+        ``opponent_history_size`` of 5 keeps only their most recent turns
+        rather than the whole match; pass 0 to switch the group off.
       - ``features["decision_chain"]``: this same actor's own last
-        ``decision_chain_size`` decisions across the whole match (oldest
-        first) — turn/selection/options/chosen target, since this is the
+        ``decision_chain_size`` decisions, scanned back across the whole match
+        (oldest first) — turn/selection/options/chosen target, since this is the
         actor's own past choices, not something being inferred about the
         opponent. The opponent's interleaved decisions are filtered out, not
         treated as a boundary, so this is purely the deciding player's

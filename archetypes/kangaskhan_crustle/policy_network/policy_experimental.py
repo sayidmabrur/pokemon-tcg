@@ -88,9 +88,9 @@ def _masked_mean_sum(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 #: Upper bound for the learned position tables. The observation spec caps both
-#: sequences at 60 (``ObservationSpec.decision_chain_size`` /
-#: ``opponent_history_size``); 64 leaves slack so a longer spec doesn't index
-#: out of range.
+#: sequences at 5 (``ObservationSpec.decision_chain_size`` /
+#: ``opponent_history_size``); 64 is left as-is so raising either cap — up to a
+#: whole-match window — doesn't index out of range.
 MAX_SEQ_LEN = 64
 
 
@@ -98,7 +98,7 @@ class ReversePositionalEmbedding(nn.Module):
     """Learned position embedding indexed by *recency*, not absolute slot.
 
     ``nn.TransformerEncoder`` is permutation-invariant on its own — with no
-    position signal, a 60-step decision chain is processed as an unordered
+    position signal, a multi-step decision chain is processed as an unordered
     bag, which is not a sequence model at all. The chains here are stored
     oldest-first and right-padded, so absolute slot 0 means "oldest" and the
     slot holding the *most recent* decision moves depending on how long the

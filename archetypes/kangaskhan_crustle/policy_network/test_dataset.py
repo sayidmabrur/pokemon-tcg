@@ -110,8 +110,8 @@ def print_history_lengths(features: dict, dataset: PolicyFeatureDataset) -> None
 
     Both sizes are caps, not guarantees: the chain is bounded by how many
     decisions this player has made so far in the episode, and the history by
-    how many turns the opponent has had.  Early-game samples are therefore
-    short even with the caps set to 60.
+    how many turns the opponent has had, so the first few samples of an
+    episode are shorter than the cap regardless of what the cap is.
     """
     chain, history = features["decision_chain"], features["opponent_history"]
     turn = features["global_state"]["turn"]

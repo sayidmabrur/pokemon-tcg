@@ -60,8 +60,15 @@ class ObservationSpec:
     this module exists to prevent; use ``replace(spec, ...)`` for a variant.
     """
 
-    opponent_history_size: int = 60
-    decision_chain_size: int = 60
+    #: Both sequences are capped at the last 5 entries rather than the whole
+    #: match. A full-match window makes the two transformer encoders carry most
+    #: of the input, and the signal they actually add is recent: what the
+    #: opponent did on their last few turns, and what this player has already
+    #: committed to in the current exchange. Turn 3 of a 30-turn match is not
+    #: what the next decision conditions on, so the longer window mostly feeds
+    #: the encoders padding-adjacent noise to overfit on.
+    opponent_history_size: int = 5
+    decision_chain_size: int = 5
     opponent_history_source: str = OWN_FRAMES
 
     def __post_init__(self) -> None:

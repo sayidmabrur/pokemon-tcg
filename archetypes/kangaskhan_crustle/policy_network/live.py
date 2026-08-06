@@ -3,7 +3,7 @@ into exactly the observation dict ``PolicyFeatureDataset`` yields.
 
 Usage in a self-play/eval loop::
 
-    feature_extractor = LiveFeatureExtractor()   # full-match defaults (60/60)
+    feature_extractor = LiveFeatureExtractor()   # spec defaults (5/5)
     obs, _ = battle_start(p0, p1)
     feature_extractor.reset()
     while obs["current"]["result"] == -1:
@@ -12,8 +12,9 @@ Usage in a self-play/eval loop::
         feature_extractor.record_action(action)   # so it lands in decision_chain
         obs = battle_select(action)
 
-Both ``opponent_history`` and ``decision_chain`` span the whole match, so
-they need memory of earlier decisions, which a single ``obs`` doesn't carry.
+Both ``opponent_history`` and ``decision_chain`` are scanned backwards through
+the match — only the last few entries are kept, but finding them still needs
+memory of earlier decisions, which a single ``obs`` doesn't carry.
 This class keeps that memory as a list of rows in the *same* shape
 ``convert_replays.py`` writes to Parquet, then hands them to
 ``observation.build_observation`` — the identical call ``dataset.py`` makes.
